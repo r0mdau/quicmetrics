@@ -13,9 +13,14 @@ import (
 	"math/big"
 
 	"github.com/lucas-clemente/quic-go"
+	"github.com/narqo/go-dogstatsd-parser"
 )
 
 const addr = "localhost:4242"
+
+type QuicMetrics map[string]*dogstatsd.Metric
+
+var qm = QuicMetrics{}
 
 // We start a server echoing data on the first stream the client opens,
 // then connect with a client, send the message, and wait for its receipt.
@@ -46,7 +51,28 @@ func echoServer() error {
 type loggingWriter struct{ io.Writer }
 
 func (w loggingWriter) Write(b []byte) (int, error) {
-	fmt.Printf("Server: Got '%s'\n", string(b))
+	raw := string(b)
+	fmt.Printf("Server: Got '%s'\n", raw)
+
+	m, err := dogstatsd.Parse(raw)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if _, ok := qm[m.Name]; !ok {
+		qm[m.Name] = m
+	} else {
+		if m.Type == dogstatsd.Counter {
+			qm[m.Name].Value = int64(qm[m.Name].Value.(int64) + m.Value.(int64))
+		}
+	}
+
+	m = qm[m.Name]
+	fmt.Println(m.Name, m.Value)
+	for k, v := range m.Tags {
+		fmt.Println(k + " - " + v)
+	}
+
 	return w.Writer.Write(b)
 }
 

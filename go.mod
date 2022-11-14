@@ -2,7 +2,10 @@ module github.com/r0mdau/quicmetrics
 
 go 1.19
 
-require github.com/lucas-clemente/quic-go v0.30.0
+require (
+	github.com/lucas-clemente/quic-go v0.30.0
+	github.com/narqo/go-dogstatsd-parser v0.2.0
+)
 
 require (
 	github.com/go-task/slim-sprig v0.0.0-20210107165309-348f09dbbbc0 // indirect
