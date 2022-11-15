@@ -25,26 +25,33 @@ var qm = QuicMetrics{}
 // We start a server echoing data on the first stream the client opens,
 // then connect with a client, send the message, and wait for its receipt.
 func main() {
-	log.Fatal(echoServer())
-}
-
-// Start a server that echos all data on the first stream opened by the client
-func echoServer() error {
 	listener, err := quic.ListenAddr(addr, generateTLSConfig(), nil)
 	if err != nil {
-		return err
+		log.Fatal(err)
 	}
-	conn, err := listener.Accept(context.Background())
-	if err != nil {
-		return err
+	for {
+		conn, err := listener.Accept(context.Background())
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("session accepted: %s", conn.RemoteAddr().String())
+
+		go func() {
+			defer func() {
+				_ = conn.CloseWithError(0, "bye")
+				log.Printf("close session: %s", conn.RemoteAddr().String())
+			}()
+			stream, err := conn.AcceptStream(context.Background())
+			if err != nil {
+				log.Fatal(err)
+			}
+			// Echo through the loggingWriter
+			_, err = io.Copy(loggingWriter{stream}, stream)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}()
 	}
-	stream, err := conn.AcceptStream(context.Background())
-	if err != nil {
-		panic(err)
-	}
-	// Echo through the loggingWriter
-	_, err = io.Copy(loggingWriter{stream}, stream)
-	return err
 }
 
 // A wrapper for io.Writer that also logs the message.
