@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"math/big"
+	"strings"
 
 	"github.com/lucas-clemente/quic-go"
 	"github.com/narqo/go-dogstatsd-parser"
@@ -29,6 +30,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer listener.Close()
+
 	for {
 		conn, err := listener.Accept(context.Background())
 		if err != nil {
@@ -54,7 +57,7 @@ func main() {
 	}
 }
 
-// A wrapper for io.Writer that also logs the message.
+// A wrapper for io.Writer
 type loggingWriter struct{ io.Writer }
 
 func (w loggingWriter) Write(b []byte) (int, error) {
@@ -66,21 +69,30 @@ func (w loggingWriter) Write(b []byte) (int, error) {
 		log.Fatal(err)
 	}
 
-	if _, ok := qm[m.Name]; !ok {
-		qm[m.Name] = m
+	mKey := uniqueMetricKey(m.Name, raw)
+	if _, ok := qm[mKey]; !ok {
+		qm[mKey] = m
 	} else {
 		if m.Type == dogstatsd.Counter {
-			qm[m.Name].Value = int64(qm[m.Name].Value.(int64) + m.Value.(int64))
+			qm[mKey].Value = int64(qm[mKey].Value.(int64) + m.Value.(int64))
 		}
 	}
+	outputQuicMetrics(mKey, qm)
 
-	m = qm[m.Name]
-	fmt.Println(m.Name, m.Value)
+	return w.Writer.Write(b)
+}
+
+func uniqueMetricKey(name, raw string) string {
+	splitTags := strings.SplitN(raw, "#", 2)
+	return fmt.Sprintf("%s%s", name, splitTags[1])
+}
+
+func outputQuicMetrics(mKey string, qm QuicMetrics) {
+	m := qm[mKey]
+	fmt.Println(mKey, m.Value)
 	for k, v := range m.Tags {
 		fmt.Println(k + " - " + v)
 	}
-
-	return w.Writer.Write(b)
 }
 
 // Setup a bare-bones TLS config for the server
