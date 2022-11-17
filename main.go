@@ -46,12 +46,12 @@ func main() {
 			}()
 			stream, err := conn.AcceptStream(context.Background())
 			if err != nil {
-				log.Fatal(err)
+				fmt.Println(err)
 			}
 			// Echo through the loggingWriter
 			_, err = io.Copy(loggingWriter{stream}, stream)
 			if err != nil {
-				log.Fatal(err)
+				fmt.Println(err)
 			}
 		}()
 	}
@@ -66,7 +66,7 @@ func (w loggingWriter) Write(b []byte) (int, error) {
 
 	m, err := dogstatsd.Parse(raw)
 	if err != nil {
-		log.Fatal(err)
+		fmt.Println(err)
 	}
 
 	mKey := uniqueMetricKey(m.Name, raw)
