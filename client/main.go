@@ -1,68 +1,72 @@
 package main
 
 import (
-	"context"
+	"bytes"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
+	"log"
+	"net/http"
+	"strings"
+	"sync"
 
 	"github.com/lucas-clemente/quic-go"
+	"github.com/lucas-clemente/quic-go/http3"
+	"github.com/r0mdau/quicmetrics/internal/testdata"
+	"github.com/scaleway/scaleway-sdk-go/logger"
 )
 
-const addr = "localhost:4242"
+const addr = "https://localhost:6121"
 
-const message1 = "users.online:1|c|#country:china,city:beijing"
-const message2 = "users.online:2|c|#country:usa,city:losangeles"
+var messages = []string{
+	"users.online:1|c|#country:china,city:beijing",
+	"users.online:2|c|#country:usa,city:losangeles",
+}
 
-// We start a server echoing data on the first stream the client opens,
-// then connect with a client, send the message, and wait for its receipt.
 func main() {
-	err := clientMain()
-	if err != nil {
-		panic(err)
-	}
-}
 
-func clientMain() error {
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"quic-echo-example"},
-	}
-	conn, err := quic.DialAddr(addr, tlsConf, nil)
+	pool, err := x509.SystemCertPool()
 	if err != nil {
-		return err
+		log.Fatal(err)
 	}
+	testdata.AddRootCA(pool)
 
-	stream, err := conn.OpenStreamSync(context.Background())
-	if err != nil {
-		return err
-	}
-	defer stream.Close()
+	var qconf quic.Config
 
-	err = sendStream(stream, message1)
-	if err != nil {
-		return err
+	roundTripper := &http3.RoundTripper{
+		TLSClientConfig: &tls.Config{
+			RootCAs:            pool,
+			InsecureSkipVerify: true,
+		},
+		QuicConfig: &qconf,
 	}
-	err = sendStream(stream, message2)
-	if err != nil {
-		return err
+	defer roundTripper.Close()
+	hclient := &http.Client{
+		Transport: roundTripper,
 	}
 
-	return nil
-}
+	var wg sync.WaitGroup
+	wg.Add(len(messages))
+	for _, message := range messages {
+		go func(message string) {
+			myReader := strings.NewReader(message)
+			rsp, err := hclient.Post(fmt.Sprintf("%s/metrics", addr), "text", myReader)
+			if err != nil {
+				log.Fatal(err)
+			}
 
-func sendStream(stream quic.Stream, message string) error {
-	fmt.Printf("Client: Sending '%s'\n", message)
-	_, err := stream.Write([]byte(message))
-	if err != nil {
-		return err
-	}
+			body := &bytes.Buffer{}
+			_, err = io.Copy(body, rsp.Body)
+			if err != nil {
+				log.Fatal(err)
+			}
 
-	buf := make([]byte, len(message))
-	_, err = io.ReadFull(stream, buf)
-	if err != nil {
-		return err
+			logger.Infof("Response Body:")
+			logger.Infof("%s", body.Bytes())
+
+			wg.Done()
+		}(message)
 	}
-	fmt.Printf("Client: Got '%s'\n", buf)
-	return nil
+	wg.Wait()
 }
