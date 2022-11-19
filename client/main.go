@@ -11,9 +11,6 @@ import (
 
 const addr = "localhost:4242"
 
-const message1 = "users.online:1|c|#country:china,city:beijing"
-const message2 = "users.online:2|c|#country:usa,city:losangeles"
-
 // We start a server echoing data on the first stream the client opens,
 // then connect with a client, send the message, and wait for its receipt.
 func main() {
@@ -39,13 +36,16 @@ func clientMain() error {
 	}
 	defer stream.Close()
 
-	err = sendStream(stream, message1)
-	if err != nil {
-		return err
+	messages := []string{
+		"users.online:1|c|#country:china,city:beijing",
+		"users.online:2|c|#country:usa,city:losangeles",
 	}
-	err = sendStream(stream, message2)
-	if err != nil {
-		return err
+
+	for _, message := range messages {
+		err = sendStream(stream, message)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
