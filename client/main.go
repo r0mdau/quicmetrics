@@ -39,6 +39,7 @@ func clientMain() error {
 	messages := []string{
 		"users.online:1|c|#country:china,city:beijing",
 		"users.online:2|c|#country:usa,city:losangeles",
+		"users.online:3|c|#country:usa",
 	}
 
 	for _, message := range messages {

@@ -11,21 +11,27 @@ import (
 	"io"
 	"log"
 	"math/big"
-	"strings"
+	"net/http"
 
 	"github.com/lucas-clemente/quic-go"
 	"github.com/narqo/go-dogstatsd-parser"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/prometheus"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/instrument"
+	smetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
 const addr = "localhost:4242"
 
-type QuicMetrics map[string]*dogstatsd.Metric
+var meter metric.Meter
 
-var qm = QuicMetrics{}
-
-// We start a server echoing data on the first stream the client opens,
-// then connect with a client, send the message, and wait for its receipt.
 func main() {
+	// Start the prometheus HTTP server and pass the exporter Collector to it
+	go serveMetrics()
+
+	log.Println("Serving QUIC metrics listener at:", addr)
 	listener, err := quic.ListenAddr(addr, generateTLSConfig(), nil)
 	if err != nil {
 		log.Fatal(err)
@@ -48,7 +54,7 @@ func main() {
 			if err != nil {
 				fmt.Println(err)
 			}
-			// Echo through the loggingWriter
+			// Aggregate through the loggingWriter
 			_, err = io.Copy(loggingWriter{stream}, stream)
 			if err != nil {
 				fmt.Println(err)
@@ -69,29 +75,36 @@ func (w loggingWriter) Write(b []byte) (int, error) {
 		fmt.Println(err)
 	}
 
-	mKey := uniqueMetricKey(m.Name, raw)
-	if _, ok := qm[mKey]; !ok {
-		qm[mKey] = m
-	} else {
-		if m.Type == dogstatsd.Counter {
-			qm[mKey].Value = int64(qm[mKey].Value.(int64) + m.Value.(int64))
+	if m.Type == dogstatsd.Counter {
+		counter, err := meter.SyncFloat64().Counter(m.Name, instrument.WithDescription("a simple counter"))
+		if err != nil {
+			log.Fatal(err)
 		}
+		attrs := []attribute.KeyValue{}
+		for k, v := range m.Tags {
+			attrs = append(attrs, attribute.Key(k).String(v))
+		}
+		counter.Add(context.Background(), float64(m.Value.(int64)), attrs...)
 	}
-	outputQuicMetrics(mKey, qm)
 
 	return w.Writer.Write(b)
 }
 
-func uniqueMetricKey(name, raw string) string {
-	splitTags := strings.SplitN(raw, "#", 2)
-	return fmt.Sprintf("%s%s", name, splitTags[1])
-}
+func serveMetrics() {
+	exporter, err := prometheus.New()
+	if err != nil {
+		log.Fatal(err)
+	}
+	provider := smetric.NewMeterProvider(smetric.WithReader(exporter))
+	meter = provider.Meter("github.com/r0mdau/quicmetrics")
 
-func outputQuicMetrics(mKey string, qm QuicMetrics) {
-	m := qm[mKey]
-	fmt.Println(mKey, m.Value)
-	for k, v := range m.Tags {
-		fmt.Println(k + " - " + v)
+	log.Println("Serving metrics at: localhost:2223/metrics")
+
+	http.Handle("/metrics", promhttp.Handler())
+	err = http.ListenAndServe(":2223", nil)
+	if err != nil {
+		fmt.Printf("error serving http: %v", err)
+		return
 	}
 }
 
