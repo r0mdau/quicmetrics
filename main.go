@@ -96,7 +96,7 @@ func serveMetrics() {
 		log.Fatal(err)
 	}
 	provider := smetric.NewMeterProvider(smetric.WithReader(exporter))
-	meter = provider.Meter("github.com/open-telemetry/opentelemetry-go/example/prometheus")
+	meter = provider.Meter("github.com/r0mdau/quicmetrics")
 
 	log.Println("Serving metrics at: localhost:2223/metrics")
 
