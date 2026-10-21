@@ -21,14 +21,11 @@ internal libraries.
 
 ## Toolchain: read this first
 
-- `go.mod` targets **Go 1.19**, and the pinned `github.com/lucas-clemente/quic-go v0.30.0`
-  **will not compile on Go ≥ 1.20**. It fails on purpose with
-  `"The version of quic-go you're using can't be built on Go 1.20 yet"`.
-- If the local `go` is newer, a build failure inside `quic-go/internal/qtls` is caused by the
-  toolchain, not by your change. Build in a Go 1.19 container instead, e.g.
-  `docker run --rm -v "$PWD":/src -w /src golang:1.19 make build`.
-- Upgrading Go means migrating to `github.com/quic-go/quic-go` (the new import path) and
-  updating the API calls. Treat that as its own task, and don't do it without being asked.
+- `go.mod` targets **Go 1.26** and uses `github.com/quic-go/quic-go v0.64.1`, which itself
+  requires Go ≥ 1.26. The old `github.com/lucas-clemente/quic-go` path must not come back.
+- In this quic-go version, `quic.Stream` is a **struct** (use `*quic.Stream`), and
+  `quic.DialAddr` takes a `context.Context` as first argument.
+- The Docker image is based on `golang:1.26-trixie`.
 - The OTel metric packages are **pre-1.0 (`v0.33.0`)**. The code uses APIs that were removed
   later (`meter.SyncFloat64()`, the `go.opentelemetry.io/otel/metric/instrument` package). Don't
   bump OTel versions as a side effect of other work.
@@ -74,12 +71,18 @@ curl localhost:2223/metrics # check aggregated output, e.g. users_online_total{.
 
 ## Known pitfalls
 
-- `m.Value.(int64)` in `loggingWriter.Write` panics if the counter value is a float
-  (e.g. `foo:1.5|c`).
+- The DogStatsD parser truncates counter values to `int64`, so `foo:1.5|c` is silently
+  recorded as `1`. Sample rates (`|@0.5`) are ignored.
+- `dogstatsd.Parse` panics on an empty trailing segment (e.g. `foo:1|c|`). Nothing recovers
+  it, so one malformed metric crashes the server.
+- The OTel Prometheus exporter `v0.33.0` appends `_total` once per data point, so a counter
+  with several attribute sets is exported as `x_total`, `x_total_total`, and so on. Fixing it
+  requires an OTel upgrade.
 - The global `meter` is set inside the `serveMetrics` goroutine, so it is nil if a metric
   arrives before that goroutine has run.
 - `log.Fatal` on instrument creation errors kills the whole server.
-- If `AcceptStream` fails, the code prints the error and continues with a nil stream.
+- If `AcceptStream` fails, the code prints the error and continues with a nil `*quic.Stream`,
+  so `io.Copy` panics and crashes the server.
 - There are **no tests** yet. If you add behavior, prefer adding `_test.go` files next to the
   code. The `loggingWriter` parsing and aggregation logic is the easiest part to unit-test.
 

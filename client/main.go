@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/lucas-clemente/quic-go"
+	"github.com/quic-go/quic-go"
 )
 
 const addr = "localhost:4242"
@@ -25,7 +25,7 @@ func clientMain() error {
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"quic-echo-example"},
 	}
-	conn, err := quic.DialAddr(addr, tlsConf, nil)
+	conn, err := quic.DialAddr(context.Background(), addr, tlsConf, nil)
 	if err != nil {
 		return err
 	}
@@ -52,7 +52,7 @@ func clientMain() error {
 	return nil
 }
 
-func sendStream(stream quic.Stream, message string) error {
+func sendStream(stream *quic.Stream, message string) error {
 	fmt.Printf("Client: Sending '%s'\n", message)
 	_, err := stream.Write([]byte(message))
 	if err != nil {

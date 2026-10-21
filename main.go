@@ -13,9 +13,9 @@ import (
 	"math/big"
 	"net/http"
 
-	"github.com/lucas-clemente/quic-go"
 	"github.com/narqo/go-dogstatsd-parser"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/quic-go/quic-go"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/metric"
