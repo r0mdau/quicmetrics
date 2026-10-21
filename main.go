@@ -72,10 +72,8 @@ func (w loggingWriter) Write(b []byte) (int, error) {
 
 	m, err := dogstatsd.Parse(raw)
 	if err != nil {
-		fmt.Println(err)
-	}
-
-	if m.Type == dogstatsd.Counter {
+		log.Printf("invalid metric %q: %v", raw, err)
+	} else if m.Type == dogstatsd.Counter {
 		counter, err := meter.SyncFloat64().Counter(m.Name, instrument.WithDescription("a simple counter"))
 		if err != nil {
 			log.Fatal(err)
