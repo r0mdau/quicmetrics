@@ -15,6 +15,7 @@ exposes them through a **Prometheus** `/metrics` endpoint.
 | `client/main.go` | Example client that sends a few sample counters over one QUIC stream |
 | `Makefile` | fmt / vet / lint / build / test / docker-build targets |
 | `Dockerfile` | Packages the prebuilt `build/quicmetrics` binary |
+| `.github/workflows/ci.yml` | On push to `main`: gofmt check, vet, `go test -race`, build |
 
 There is a single Go module (`github.com/r0mdau/quicmetrics`), two `main` packages, and no
 internal libraries.
@@ -83,8 +84,9 @@ curl localhost:2223/metrics # check aggregated output, e.g. users_online_total{.
 - `log.Fatal` on instrument creation errors kills the whole server.
 - If `AcceptStream` fails, the code prints the error and continues with a nil `*quic.Stream`,
   so `io.Copy` panics and crashes the server.
-- There are **no tests** yet. If you add behavior, prefer adding `_test.go` files next to the
-  code. The `loggingWriter` parsing and aggregation logic is the easiest part to unit-test.
+- `main_test.go` holds **contract tests** (echo, counter aggregation, ignored input, Prometheus
+  exposition). They deliberately don't pin the quirks above, so they should keep passing when
+  those are fixed. Add new `_test.go` files next to the code they cover.
 
 ## Conventions
 
