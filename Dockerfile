@@ -1,6 +1,14 @@
-FROM golang:1.26-trixie
+FROM golang:1.26-trixie AS build
 
-COPY build/quicmetrics /usr/local/bin/
-RUN chmod 755 /usr/local/bin/quicmetrics
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/quicmetrics ./cmd/quicmetrics
 
-ENTRYPOINT ["quicmetrics"]
+FROM gcr.io/distroless/static-debian13:nonroot
+
+COPY --from=build /out/quicmetrics /usr/local/bin/quicmetrics
+EXPOSE 4242/udp 2223/tcp
+ENTRYPOINT ["/usr/local/bin/quicmetrics"]
+CMD ["-addr", "0.0.0.0:4242"]

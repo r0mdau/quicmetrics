@@ -1,0 +1,154 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"regexp"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/quic-go/quic-go"
+
+	"github.com/r0mdau/quicmetrics/internal/protocol"
+)
+
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+var (
+	quicAddrRe = regexp.MustCompile(`msg="serving QUIC metrics listener" addr=(\S+)`)
+	httpAddrRe = regexp.MustCompile(`msg="serving Prometheus metrics" addr=(\S+)`)
+)
+
+func waitForAddr(t *testing.T, logs *syncBuffer, re *regexp.Regexp) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if m := re.FindStringSubmatch(logs.String()); m != nil {
+			return m[1]
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("server never logged %s:\n%s", re, logs.String())
+	return ""
+}
+
+func sendMetric(t *testing.T, stream *quic.Stream, msg string) {
+	t.Helper()
+	if _, err := stream.Write([]byte(msg)); err != nil {
+		t.Fatalf("write %q: %v", msg, err)
+	}
+	if _, err := io.ReadFull(stream, make([]byte, len(msg))); err != nil {
+		t.Fatalf("read ack of %q: %v", msg, err)
+	}
+}
+
+func TestRunServesMetricsAndShutsDownCleanly(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var logs syncBuffer
+	errc := make(chan error, 1)
+	go func() {
+		errc <- run(ctx, []string{"-addr", "127.0.0.1:0", "-metrics-addr", "127.0.0.1:0"}, &logs)
+	}()
+	quicAddr := waitForAddr(t, &logs, quicAddrRe)
+	httpAddr := waitForAddr(t, &logs, httpAddrRe)
+
+	dialCtx, cancelDial := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelDial()
+	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{protocol.ALPN}, MinVersion: tls.VersionTLS13}
+	conn, err := quic.DialAddr(dialCtx, quicAddr, tlsConf, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.CloseWithError(0, "") }()
+	stream, err := conn.OpenStreamSync(dialCtx)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	for _, msg := range []string{
+		"e2e.hits:4|c|#env:test",
+		"a.b:1|c",
+		"a_b:1|c",
+		"process_cpu_seconds:1|c",
+	} {
+		sendMetric(t, stream, msg)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("http://" + httpAddr + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /metrics status = %d, want 200 despite colliding metric names:\n%s", resp.StatusCode, body)
+	}
+	for _, want := range []string{`e2e_hits_total{env="test"} 4`, "go_goroutines", "promhttp_metric_handler_requests_total"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("/metrics missing %q", want)
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Errorf("run = %v, want nil after cancel", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not return after cancel")
+	}
+}
+
+func TestRunFailsWhenMetricsPortIsTaken(t *testing.T) {
+	t.Parallel()
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = taken.Close() }()
+
+	err = run(context.Background(), []string{"-addr", "127.0.0.1:0", "-metrics-addr", taken.Addr().String()}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "listen HTTP") {
+		t.Fatalf("run = %v, want a listen HTTP error", err)
+	}
+}
+
+func TestRunFlags(t *testing.T) {
+	t.Parallel()
+	if err := run(context.Background(), []string{"-h"}, io.Discard); err != nil {
+		t.Errorf("run -h = %v, want nil", err)
+	}
+	for _, args := range [][]string{{"-no-such-flag"}, {"-log-level", "loud"}} {
+		if err := run(context.Background(), args, io.Discard); !errors.Is(err, errUsage) {
+			t.Errorf("run %v = %v, want errUsage", args, err)
+		}
+	}
+}

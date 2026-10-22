@@ -6,29 +6,57 @@ This proof of concept uses:
 - [QUIC](https://peering.google.com/#/learn-more/quic) without http3 as a transport protocol
 - statsd string format for metrics
 
-In the `client/main.go` example, we send multiple metric counter, to confirm it is summed in the prometheus endpoint output.
+The `quicmetrics-client` example sends several counters, so you can check that they are
+summed in the Prometheus endpoint output.
 
-Library used:
+Libraries used:
 - [quic-go](https://github.com/quic-go/quic-go), a QUIC implementation in pure go
 - [go-dogstatsd-parser](https://github.com/narqo/go-dogstatsd-parser), a standalone parser for DogStatsD metrics protocol
-- [prometheus/client_golang](github.com/prometheus/client_golang), the Go client library for prometheus
+- [prometheus/client_golang](https://github.com/prometheus/client_golang), the Go client library for prometheus
 - [opentelemetry-go](https://github.com/open-telemetry/opentelemetry-go), the Go implementation of OpenTelemetry
+
+## Layout
+
+| Path | Role |
+| --- | --- |
+| `cmd/quicmetrics` | Server command: flags, wiring, graceful shutdown |
+| `cmd/quicmetrics-client` | Example client that sends sample counters |
+| `internal/server` | QUIC sessions, DogStatsD parsing, OpenTelemetry aggregation, TLS |
+| `internal/protocol` | ALPN and default address shared by server and client |
 
 ## Getting started
 
 Launch the server
 
-    go run main.go
-
+    go run ./cmd/quicmetrics
 
 Send sample metrics
 
-    go run client/main.go
-
+    go run ./cmd/quicmetrics-client
 
 View prometheus metrics
 
     curl localhost:2223/metrics
+
+Server flags:
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `-addr` | `localhost:4242` | UDP address of the QUIC listener |
+| `-metrics-addr` | `:2223` | TCP address of the Prometheus `/metrics` endpoint |
+| `-log-level` | `info` | `debug` also logs every received metric |
+
+The client accepts `-addr` (default `localhost:4242`). The server stops gracefully on
+`SIGINT` or `SIGTERM`.
+
+## Development
+
+    make check   # fmt, vet, golangci-lint, tests with -race
+    make vuln    # govulncheck
+    make build   # binaries in build/
+
+`make lint` needs [golangci-lint](https://golangci-lint.run/welcome/install/) v2
+(CI pins v2.15.0).
 
 ## Run with docker compose
 
@@ -42,19 +70,14 @@ The [compose.yaml](compose.yaml) suite runs the server together with a
 | `quicmetrics` | `2223/tcp` | Prometheus `/metrics` endpoint |
 | `prometheus` | `9090/tcp` | Prometheus UI |
 
-Build the binary and start the suite (the image packages the prebuilt
-`build/quicmetrics` binary, so `make build` must run first):
+Start the suite. The image is built from source in a multi-stage Docker build and runs as a
+non-root distroless container:
 
     make compose-up
 
-which is equivalent to:
-
-    make build
-    docker compose up --build -d
-
 Send sample metrics from your machine to the server running in docker compose:
 
-    go run client/main.go
+    go run ./cmd/quicmetrics-client
 
 Check the metrics:
 
