@@ -1,41 +1,32 @@
-package main
+package server
 
 import (
-	"bytes"
 	"context"
-	"errors"
-	"io"
-	"net/http"
-	"net/http/httptest"
-	"strings"
+	"log/slog"
 	"testing"
 
-	promclient "github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/narqo/go-dogstatsd-parser"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/prometheus"
-	smetric "go.opentelemetry.io/otel/sdk/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
-func useReader(t *testing.T, reader smetric.Reader) {
-	t.Helper()
-	previous := meter
-	meter = smetric.NewMeterProvider(smetric.WithReader(reader)).Meter("test")
-	t.Cleanup(func() { meter = previous })
+var discardLogger = slog.New(slog.DiscardHandler)
+
+func newAggregator(reader sdkmetric.Reader) *Aggregator {
+	meter := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
+	return NewAggregator(meter, discardLogger)
 }
 
-func newTestReader(t *testing.T) smetric.Reader {
-	t.Helper()
-	reader := smetric.NewManualReader()
-	useReader(t, reader)
-	return reader
+func newTestAggregator() (*Aggregator, sdkmetric.Reader) {
+	reader := sdkmetric.NewManualReader()
+	return newAggregator(reader), reader
 }
 
-func collectSums(t *testing.T, reader smetric.Reader) map[string]metricdata.Sum[float64] {
+func collectSums(t *testing.T, reader sdkmetric.Reader) map[string]metricdata.Sum[float64] {
 	t.Helper()
-	rm, err := reader.Collect(context.Background())
-	if err != nil {
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
 		t.Fatalf("collect: %v", err)
 	}
 	sums := map[string]metricdata.Sum[float64]{}
@@ -66,17 +57,6 @@ func values(sums map[string]metricdata.Sum[float64]) map[string]float64 {
 	return out
 }
 
-func write(t *testing.T, w io.Writer, msg string) {
-	t.Helper()
-	n, err := w.Write([]byte(msg))
-	if err != nil {
-		t.Fatalf("Write(%q): %v", msg, err)
-	}
-	if n != len(msg) {
-		t.Fatalf("Write(%q) = %d bytes, want %d", msg, n, len(msg))
-	}
-}
-
 func assertValues(t *testing.T, got, want map[string]float64) {
 	t.Helper()
 	if len(got) != len(want) {
@@ -89,40 +69,43 @@ func assertValues(t *testing.T, got, want map[string]float64) {
 	}
 }
 
-func TestWriteEchoesInput(t *testing.T) {
-	newTestReader(t)
-
-	for _, msg := range []string{
-		"users.online:1|c|#country:france",
-		"temperature:21.5|g",
-		"not a metric",
-		"",
-	} {
-		t.Run(msg, func(t *testing.T) {
-			var buf bytes.Buffer
-			write(t, loggingWriter{&buf}, msg)
-			if buf.String() != msg {
-				t.Errorf("echo = %q, want %q", buf.String(), msg)
+func TestParse(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		raw     string
+		wantErr bool
+	}{
+		{name: "counter", raw: "foo:1|c|#a:b"},
+		{name: "gauge", raw: "temperature:21.5|g"},
+		{name: "empty trailing segment panics in the parser", raw: "foo:1|c|", wantErr: true},
+		{name: "empty middle segment panics in the parser", raw: "foo:1|c||#a:b", wantErr: true},
+		{name: "invalid UTF-8 name", raw: "foo\xff:1|c", wantErr: true},
+		{name: "invalid UTF-8 tag", raw: "foo:1|c|#k:v\xff", wantErr: true},
+		{name: "garbage", raw: "garbage", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m, err := Parse(tt.raw)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("Parse(%q) = %+v, want an error", tt.raw, m)
+				}
+				if m != nil {
+					t.Errorf("Parse(%q) metric = %+v, want nil", tt.raw, m)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tt.raw, err)
 			}
 		})
 	}
 }
 
-type failingWriter struct{ err error }
-
-func (f failingWriter) Write([]byte) (int, error) { return 0, f.err }
-
-func TestWritePropagatesEchoError(t *testing.T) {
-	newTestReader(t)
-	want := errors.New("stream closed")
-
-	_, err := loggingWriter{failingWriter{want}}.Write([]byte("foo:1|c"))
-	if !errors.Is(err, want) {
-		t.Fatalf("err = %v, want %v", err, want)
-	}
-}
-
 func TestCounterAggregation(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		messages []string
@@ -164,10 +147,10 @@ func TestCounterAggregation(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reader := newTestReader(t)
-			w := loggingWriter{io.Discard}
+			t.Parallel()
+			agg, reader := newTestAggregator()
 			for _, msg := range tt.messages {
-				write(t, w, msg)
+				agg.Record(context.Background(), msg)
 			}
 			assertValues(t, values(collectSums(t, reader)), tt.want)
 		})
@@ -175,8 +158,9 @@ func TestCounterAggregation(t *testing.T) {
 }
 
 func TestCounterIsMonotonicAndCumulative(t *testing.T) {
-	reader := newTestReader(t)
-	write(t, loggingWriter{io.Discard}, "foo:1|c")
+	t.Parallel()
+	agg, reader := newTestAggregator()
+	agg.Record(context.Background(), "foo:1|c")
 
 	sum, ok := collectSums(t, reader)["foo{}"]
 	if !ok {
@@ -191,6 +175,7 @@ func TestCounterIsMonotonicAndCumulative(t *testing.T) {
 }
 
 func TestIgnoredInputRecordsNothing(t *testing.T) {
+	t.Parallel()
 	for _, msg := range []string{
 		"temperature:21.5|g",
 		"latency:12|h",
@@ -200,11 +185,16 @@ func TestIgnoredInputRecordsNothing(t *testing.T) {
 		"foo:1",
 		"foo:abc|c",
 		"foo:1|x",
+		"9lives:1|c",
+		"foo@bar:1|c",
+		"foo:1|c|#_:v",
+		"foo:1|c|#__name__:x",
 		"",
 	} {
 		t.Run(msg, func(t *testing.T) {
-			reader := newTestReader(t)
-			write(t, loggingWriter{io.Discard}, msg)
+			t.Parallel()
+			agg, reader := newTestAggregator()
+			agg.Record(context.Background(), msg)
 			if got := collectSums(t, reader); len(got) != 0 {
 				t.Errorf("recorded %v, want nothing", values(got))
 			}
@@ -212,36 +202,17 @@ func TestIgnoredInputRecordsNothing(t *testing.T) {
 	}
 }
 
-func TestPrometheusExposition(t *testing.T) {
-	registry := promclient.NewRegistry()
-	exporter, err := prometheus.New(prometheus.WithRegisterer(registry))
-	if err != nil {
-		t.Fatalf("exporter: %v", err)
-	}
-	useReader(t, exporter)
+func TestRecordCounterValueTypes(t *testing.T) {
+	t.Parallel()
+	agg, reader := newTestAggregator()
+	ctx := context.Background()
+	agg.recordCounter(ctx, &dogstatsd.Metric{Type: dogstatsd.Counter, Name: "ints", Value: int64(2)})
+	agg.recordCounter(ctx, &dogstatsd.Metric{Type: dogstatsd.Counter, Name: "floats", Value: 1.5})
+	agg.recordCounter(ctx, &dogstatsd.Metric{Type: dogstatsd.Counter, Name: "strings", Value: "x"})
+	agg.recordCounter(ctx, &dogstatsd.Metric{Type: dogstatsd.Counter, Name: "nils"})
 
-	w := loggingWriter{io.Discard}
-	write(t, w, "users.online:1|c|#country:usa")
-	write(t, w, "users.online:2|c|#country:usa")
-
-	srv := httptest.NewServer(promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
-	defer srv.Close()
-	resp, err := http.Get(srv.URL)
-	if err != nil {
-		t.Fatalf("GET /metrics: %v", err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-
-	for _, want := range []string{
-		"# TYPE users_online_total counter",
-		`users_online_total{country="usa"} 3`,
-	} {
-		if !strings.Contains(string(body), want) {
-			t.Errorf("/metrics missing %q:\n%s", want, body)
-		}
-	}
+	assertValues(t, values(collectSums(t, reader)), map[string]float64{
+		"ints{}":   2,
+		"floats{}": 1.5,
+	})
 }
