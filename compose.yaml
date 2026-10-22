@@ -1,0 +1,17 @@
+services:
+  quicmetrics:
+    build: .
+    image: r0mdau/quicmetrics
+    command: ["-addr", "0.0.0.0:4242"]
+    ports:
+      - "4242:4242/udp"
+      - "2223:2223"
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    depends_on:
+      - quicmetrics
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"

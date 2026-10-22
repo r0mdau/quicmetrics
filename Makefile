@@ -23,6 +23,15 @@ docker-build: build
 	docker build -t r0mdau/quicmetrics .
 .PHONY:docker-build
 
+compose-up: build
+	@echo ">> starting docker compose suite"
+	docker compose up --build -d
+.PHONY:compose-up
+
+compose-down:
+	docker compose down
+.PHONY:compose-down
+
 test:
 	go test -cover ./...
 .PHONY:test

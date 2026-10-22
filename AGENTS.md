@@ -13,8 +13,10 @@ exposes them through a **Prometheus** `/metrics` endpoint.
 | --- | --- |
 | `main.go` | Server: QUIC listener + DogStatsD parsing + OTel aggregation + Prometheus HTTP endpoint |
 | `client/main.go` | Example client that sends a few sample counters over one QUIC stream |
-| `Makefile` | fmt / vet / lint / build / test / docker-build targets |
+| `Makefile` | fmt / vet / lint / build / test / docker-build / compose-up / compose-down targets |
 | `Dockerfile` | Packages the prebuilt `build/quicmetrics` binary |
+| `compose.yaml` | Docker compose suite: server + Prometheus scraping it |
+| `prometheus/prometheus.yml` | Prometheus scrape config used by the compose suite |
 | `.github/workflows/ci.yml` | On push to `main`: gofmt check, vet, `go test -race`, build |
 
 There is a single Go module (`github.com/r0mdau/quicmetrics`), two `main` packages, and no
@@ -41,6 +43,8 @@ make lint       # golint ./...  (needs golint on PATH)
 make test       # go test -cover ./...
 make verify     # fmt + test
 make docker-build   # build, then docker build -t r0mdau/quicmetrics .
+make compose-up     # build, then docker compose up --build -d (server + Prometheus on :9090)
+make compose-down   # docker compose down
 ```
 
 Run locally (3 terminals):
@@ -53,8 +57,11 @@ curl localhost:2223/metrics # check aggregated output, e.g. users_online_total{.
 
 ## Architecture and protocol details
 
-- **Ports**: QUIC listens on `localhost:4242` (hardcoded `addr` const in *both* `main.go` and
-  `client/main.go`, so keep them in sync). Prometheus HTTP listens on `:2223`.
+- **Ports**: the server's QUIC listener defaults to `localhost:4242` (UDP) and can be changed
+  with the `-addr` flag. The client dials the hardcoded `addr` const `localhost:4242` in
+  `client/main.go`, so keep the default and the client in sync. Prometheus HTTP listens on
+  `:2223`. The compose suite runs the server with `-addr 0.0.0.0:4242` so the host port
+  mapping works, and exposes Prometheus on `:9090`.
 - **TLS**: the server makes a throwaway self-signed RSA cert at every startup
   (`generateTLSConfig`). The client uses `InsecureSkipVerify: true`.
 - **ALPN**: both sides must use the same `NextProtos` value, currently `"quic-echo-example"`.

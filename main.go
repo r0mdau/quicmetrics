@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -23,16 +24,18 @@ import (
 	smetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
-const addr = "localhost:4242"
+var listenAddr = flag.String("addr", "localhost:4242", "UDP address the QUIC listener binds to")
 
 var meter metric.Meter
 
 func main() {
+	flag.Parse()
+
 	// Start the prometheus HTTP server and pass the exporter Collector to it
 	go serveMetrics()
 
-	log.Println("Serving QUIC metrics listener at:", addr)
-	listener, err := quic.ListenAddr(addr, generateTLSConfig(), nil)
+	log.Println("Serving QUIC metrics listener at:", *listenAddr)
+	listener, err := quic.ListenAddr(*listenAddr, generateTLSConfig(), nil)
 	if err != nil {
 		log.Fatal(err)
 	}
