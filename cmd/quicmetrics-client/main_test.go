@@ -43,8 +43,8 @@ func TestRunSendsSampleMetricsToServer(t *testing.T) {
 		t.Fatalf("Serve: %v", err)
 	}
 
-	rm, err := reader.Collect(context.Background())
-	if err != nil {
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
 		t.Fatalf("collect: %v", err)
 	}
 	got := map[string]float64{}

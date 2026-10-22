@@ -110,10 +110,13 @@ func TestRunServesMetricsAndShutsDownCleanly(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /metrics status = %d, want 200 despite colliding metric names:\n%s", resp.StatusCode, body)
 	}
-	for _, want := range []string{`e2e_hits_total{env="test"} 4`, "go_goroutines", "promhttp_metric_handler_requests_total"} {
+	for _, want := range []string{`e2e_hits_total{env="test"} 4`, "target_info", "go_goroutines", "promhttp_metric_handler_requests_total"} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("/metrics missing %q", want)
 		}
+	}
+	if strings.Contains(string(body), "otel_scope_") {
+		t.Errorf("/metrics has scope labels:\n%s", body)
 	}
 
 	cancel()

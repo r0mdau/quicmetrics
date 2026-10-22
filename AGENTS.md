@@ -21,13 +21,15 @@ go run ./cmd/quicmetrics            # QUIC on localhost:4242/udp, metrics on :22
 go run ./cmd/quicmetrics-client     # send sample counters
 ```
 
-## Pinned dependencies
+## Dependencies
 
 - Go **1.26** with `github.com/quic-go/quic-go v0.64.1`: `*quic.Stream` and `*quic.Conn`
   are structs, and `quic.DialAddr` takes a `context.Context`. Never bring back
   `lucas-clemente/quic-go`.
-- OTel metrics are **pre-1.0 (`v0.33.0`)**, and the code relies on APIs removed later
-  (`meter.SyncFloat64()`, the `metric/instrument` package). Don't bump OTel as a side effect.
+- OTel uses the stable metric API (`go.opentelemetry.io/otel` v1.47, Prometheus exporter
+  v0.69). All exporter options live in `server.NewPrometheusMeterProvider`: Prometheus-style
+  names (`users.online` becomes `users_online_total`) and no `otel_scope_*` labels. Keep them
+  there so tests and production expose the same series.
 
 ## Protocol rules
 
@@ -40,6 +42,10 @@ go run ./cmd/quicmetrics-client     # send sample counters
   each echo before sending the next metric. Several metrics in one read fail to parse.
 - Only counters (`|c`) are recorded, with tags as attributes. Invalid lines are logged as
   warnings, and other metric types at debug level. Both are echoed, but not recorded.
+- Metric names must be valid OTel instrument names (start with a letter, then
+  `[A-Za-z0-9_.-/]`, up to 255 characters). Other names are logged and dropped.
+- Tag keys need an ASCII letter or digit and must not start with `__`, otherwise the whole
+  metric is logged and dropped: the exporter can't turn such keys into label names.
 
 ## Crash safety
 
@@ -48,18 +54,18 @@ One client must never take the server down.
 - `panic` and fatal exits are only allowed at startup, in `cmd/`. Per-metric errors are
   logged and the metric is dropped. `handleConn` recovers panics within its own session.
 - Always parse with `server.Parse`, never `dogstatsd.Parse`. It recovers the parser's panic on
-  empty segments (`foo:1|c|`) and rejects invalid UTF-8.
-- Panics while serving `/metrics` **can't be recovered**: they happen in client_golang
-  goroutines. The exporter panics on names that aren't valid UTF-8, so validate any new
-  client-controlled data before it reaches OTel.
-- `/metrics` uses `promhttp.ContinueOnError`: colliding series (e.g. `a.b` and `a_b`) are
-  logged and skipped instead of turning every scrape into an HTTP 500.
+  empty segments (`foo:1|c|`) and rejects invalid UTF-8, which would otherwise make every
+  later scrape log an error and drop the series (HTTP 500 without `ContinueOnError`).
+- client_golang recovers panics in collectors, but a panic still drops every OTel series on
+  every scrape. Validate any new client-controlled data before it reaches OTel.
+- `/metrics` uses `promhttp.ContinueOnError`: colliding series (e.g. `a.b` and `a_b`, or `foo`
+  and `foo.total`) are logged and skipped instead of turning every scrape into an HTTP 500.
 
 ## Known quirks (not yet fixed)
 
 - Counter values are truncated to `int64` (`1.5` is recorded as `1`). Sample rates are ignored.
-- The exporter appends `_total` once per data point, so you get `x_total`, `x_total_total`,
-  and so on. Fixing it requires an OTel upgrade.
+- Each counter keeps at most 2000 tag sets (`NewPrometheusMeterProvider`). Beyond that,
+  values go to a single `otel_metric_overflow="true"` series.
 
 ## Conventions
 

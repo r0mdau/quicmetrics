@@ -5,16 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/narqo/go-dogstatsd-parser"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/metric/instrument"
 )
 
 // Parse parses a single DogStatsD line. Unlike dogstatsd.Parse it never panics, and it
-// rejects input that is not valid UTF-8 because the Prometheus exporter panics on such names.
+// rejects input that is not valid UTF-8 because client_golang rejects such label values, which
+// would break every later scrape.
 func Parse(raw string) (m *dogstatsd.Metric, err error) {
 	if !utf8.ValidString(raw) {
 		return nil, errors.New("metric is not valid UTF-8")
@@ -67,14 +68,29 @@ func (a *Aggregator) recordCounter(ctx context.Context, m *dogstatsd.Metric) {
 		return
 	}
 
-	counter, err := a.meter.SyncFloat64().Counter(m.Name, instrument.WithDescription("a simple counter"))
+	for k := range m.Tags {
+		if !validTagKey(k) {
+			a.logger.Warn("invalid tag key", "name", m.Name, "key", k)
+			return
+		}
+	}
+
+	counter, err := a.meter.Float64Counter(m.Name, metric.WithDescription("a simple counter"))
 	if err != nil {
 		a.logger.Warn("create counter", "name", m.Name, "err", err)
 		return
 	}
 	attrs := make([]attribute.KeyValue, 0, len(m.Tags))
 	for k, v := range m.Tags {
-		attrs = append(attrs, attribute.Key(k).String(v))
+		attrs = append(attrs, attribute.String(k, v))
 	}
-	counter.Add(ctx, value, attrs...)
+	counter.Add(ctx, value, metric.WithAttributes(attrs...))
+}
+
+// validTagKey reports whether k becomes a usable Prometheus label name: it needs an ASCII
+// letter or digit, and the `__` prefix is reserved by Prometheus.
+func validTagKey(k string) bool {
+	return !strings.HasPrefix(k, "__") && strings.ContainsFunc(k, func(r rune) bool {
+		return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9'
+	})
 }

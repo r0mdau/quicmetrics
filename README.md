@@ -83,12 +83,9 @@ Check the metrics:
 
 - raw endpoint: `curl localhost:2223/metrics`
 - Prometheus UI: open
-  <http://localhost:9090/query?g0.expr=%7B__name__%3D~%22users_online.*%22%7D>
-  (query `{__name__=~"users_online.*"}`) and click **Execute**. Switch to the
-  **Graph** tab to watch the counters grow each time you rerun the client.
-  The regex is needed because the current OpenTelemetry Prometheus exporter
-  appends `_total` once per attribute set (`users_online_total`,
-  `users_online_total_total`, ...).
+  <http://localhost:9090/query?g0.expr=users_online_total>
+  (query `users_online_total`) and click **Execute**. Switch to the **Graph** tab to
+  watch the counters grow each time you rerun the client.
 - scrape target health: <http://localhost:9090/targets>, the `quicmetrics` job
   should be **UP**
 

@@ -2,18 +2,11 @@ package server
 
 import (
 	"context"
-	"io"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/narqo/go-dogstatsd-parser"
-	promclient "github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/prometheus"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
@@ -32,8 +25,8 @@ func newTestAggregator() (*Aggregator, sdkmetric.Reader) {
 
 func collectSums(t *testing.T, reader sdkmetric.Reader) map[string]metricdata.Sum[float64] {
 	t.Helper()
-	rm, err := reader.Collect(context.Background())
-	if err != nil {
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
 		t.Fatalf("collect: %v", err)
 	}
 	sums := map[string]metricdata.Sum[float64]{}
@@ -74,35 +67,6 @@ func assertValues(t *testing.T, got, want map[string]float64) {
 			t.Errorf("series %s = %v, want %v (all: %v)", k, got[k], v, got)
 		}
 	}
-}
-
-func scrape(t *testing.T, registry *promclient.Registry) string {
-	t.Helper()
-	srv := httptest.NewServer(promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
-	defer srv.Close()
-	resp, err := http.Get(srv.URL)
-	if err != nil {
-		t.Fatalf("GET /metrics: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, body:\n%s", resp.StatusCode, body)
-	}
-	return string(body)
-}
-
-func newPrometheusAggregator(t *testing.T) (*Aggregator, *promclient.Registry) {
-	t.Helper()
-	registry := promclient.NewRegistry()
-	exporter, err := prometheus.New(prometheus.WithRegisterer(registry))
-	if err != nil {
-		t.Fatalf("exporter: %v", err)
-	}
-	return newAggregator(exporter), registry
 }
 
 func TestParse(t *testing.T) {
@@ -221,6 +185,10 @@ func TestIgnoredInputRecordsNothing(t *testing.T) {
 		"foo:1",
 		"foo:abc|c",
 		"foo:1|x",
+		"9lives:1|c",
+		"foo@bar:1|c",
+		"foo:1|c|#_:v",
+		"foo:1|c|#__name__:x",
 		"",
 	} {
 		t.Run(msg, func(t *testing.T) {
@@ -247,33 +215,4 @@ func TestRecordCounterValueTypes(t *testing.T) {
 		"ints{}":   2,
 		"floats{}": 1.5,
 	})
-}
-
-func TestPrometheusExposition(t *testing.T) {
-	t.Parallel()
-	agg, registry := newPrometheusAggregator(t)
-	agg.Record(context.Background(), "users.online:1|c|#country:usa")
-	agg.Record(context.Background(), "users.online:2|c|#country:usa")
-
-	body := scrape(t, registry)
-	for _, want := range []string{
-		"# TYPE users_online_total counter",
-		`users_online_total{country="usa"} 3`,
-	} {
-		if !strings.Contains(body, want) {
-			t.Errorf("/metrics missing %q:\n%s", want, body)
-		}
-	}
-}
-
-func TestInvalidUTF8IsNotRecordedAndScrapeSurvives(t *testing.T) {
-	t.Parallel()
-	agg, registry := newPrometheusAggregator(t)
-	for _, msg := range []string{"foo\xff:1|c", "a\xff:1|c", "ok:1|c|#k:v\xff", "ok:1|c|#k\xff:v", "ok:1|c"} {
-		agg.Record(context.Background(), msg)
-	}
-
-	if body := scrape(t, registry); !strings.Contains(body, "ok_total 1") {
-		t.Errorf("/metrics missing ok_total 1:\n%s", body)
-	}
 }

@@ -21,8 +21,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/quic-go/quic-go"
-	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
-	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
 	"github.com/r0mdau/quicmetrics/internal/protocol"
 	"github.com/r0mdau/quicmetrics/internal/server"
@@ -65,11 +63,10 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
-	exporter, err := otelprom.New(otelprom.WithRegisterer(registry))
+	provider, err := server.NewPrometheusMeterProvider(registry)
 	if err != nil {
-		return fmt.Errorf("create Prometheus exporter: %w", err)
+		return err
 	}
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(exporter))
 	meter := provider.Meter("github.com/r0mdau/quicmetrics")
 
 	tlsConf, err := server.SelfSignedTLSConfig()
