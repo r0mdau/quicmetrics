@@ -27,6 +27,9 @@ jobs:
       - name: Test
         run: go test -race -cover ./...
 
+      - name: Benchmarks (one iteration each)
+        run: go test -run '^$' -bench . -benchtime=1x ./...
+
       - name: Build
         run: go build ./...
 

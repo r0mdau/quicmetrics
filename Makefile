@@ -27,6 +27,10 @@ test:
 	go test -race -cover ./...
 .PHONY:test
 
+bench:
+	go test -run '^$$' -bench . -benchmem ./...
+.PHONY:bench
+
 check: fmt vet lint test
 .PHONY:check
 

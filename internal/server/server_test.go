@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,7 +50,7 @@ func assertNoSessionPanic(t *testing.T, logs *syncBuffer) {
 	}
 }
 
-func listenQUIC(t *testing.T) *quic.Listener {
+func listenQUIC(t testing.TB) *quic.Listener {
 	t.Helper()
 	tlsConf, err := SelfSignedTLSConfig()
 	if err != nil {
@@ -62,7 +64,7 @@ func listenQUIC(t *testing.T) *quic.Listener {
 	return listener
 }
 
-func dialQUIC(ctx context.Context, t *testing.T, listener *quic.Listener) *quic.Conn {
+func dialQUIC(ctx context.Context, t testing.TB, listener *quic.Listener) *quic.Conn {
 	t.Helper()
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
@@ -100,17 +102,24 @@ func waitDone(t *testing.T, done <-chan struct{}) {
 	}
 }
 
-func sendAndExpectEcho(t *testing.T, stream *quic.Stream, msg string) {
-	t.Helper()
+func echoOnce(stream *quic.Stream, msg string) error {
 	if _, err := stream.Write([]byte(msg)); err != nil {
-		t.Fatalf("write %q: %v", msg, err)
+		return fmt.Errorf("write %q: %w", msg, err)
 	}
 	echo := make([]byte, len(msg))
 	if _, err := io.ReadFull(stream, echo); err != nil {
-		t.Fatalf("read echo of %q: %v", msg, err)
+		return fmt.Errorf("read echo of %q: %w", msg, err)
 	}
 	if string(echo) != msg {
-		t.Errorf("echo = %q, want %q", echo, msg)
+		return fmt.Errorf("echo = %q, want %q", echo, msg)
+	}
+	return nil
+}
+
+func sendAndExpectEcho(t *testing.T, stream *quic.Stream, msg string) {
+	t.Helper()
+	if err := echoOnce(stream, msg); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -285,4 +294,63 @@ func TestServeClosesSessionsWhenContextCancelled(t *testing.T) {
 		t.Error("session still open after Serve returned")
 	}
 	assertValues(t, values(collectSums(t, reader)), map[string]float64{"foo{}": 1})
+}
+
+func serveQUIC(ctx context.Context, tb testing.TB, srv *Server) *quic.Listener {
+	tb.Helper()
+	listener := listenQUIC(tb)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = srv.Serve(ctx, listener)
+	}()
+	tb.Cleanup(func() { <-done })
+	return listener
+}
+
+// BenchmarkSessionsParallel sends generated counters from several QUIC connections at once,
+// each waiting for its echo before the next write like the real client.
+func BenchmarkSessionsParallel(b *testing.B) {
+	lines := benchLines(b, 1024)
+	for _, conns := range []int{1, 4, 16} {
+		b.Run(fmt.Sprintf("conns_%d", conns), func(b *testing.B) {
+			ctx := b.Context()
+			agg, reader := newTestAggregator()
+			listener := serveQUIC(ctx, b, New(agg, discardLogger))
+			streams := make([]*quic.Stream, conns)
+			for i := range streams {
+				stream, err := dialQUIC(ctx, b, listener).OpenStreamSync(ctx)
+				if err != nil {
+					b.Fatalf("open stream: %v", err)
+				}
+				if err := echoOnce(stream, lines[0]); err != nil {
+					b.Fatal(err)
+				}
+				streams[i] = stream
+			}
+
+			var next atomic.Int64
+			var wg sync.WaitGroup
+			b.ResetTimer()
+			for _, stream := range streams {
+				wg.Go(func() {
+					for i := next.Add(1); i <= int64(b.N); i = next.Add(1) {
+						if err := echoOnce(stream, lines[int(i)%len(lines)]); err != nil {
+							b.Error(err)
+							return
+						}
+					}
+				})
+			}
+			wg.Wait()
+			b.StopTimer()
+			b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "metrics/s")
+
+			if !b.Failed() {
+				if got, want := sumValues(values(collectSums(b, reader))), float64(b.N+conns); got != want {
+					b.Fatalf("recorded total = %v, want %v", got, want)
+				}
+			}
+		})
+	}
 }

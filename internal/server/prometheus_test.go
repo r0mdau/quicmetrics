@@ -2,17 +2,21 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-func newPrometheusAggregator(t *testing.T) (*Aggregator, *prometheus.Registry) {
+func newPrometheusAggregator(t testing.TB) (*Aggregator, *prometheus.Registry) {
 	t.Helper()
 	registry := prometheus.NewRegistry()
 	provider, err := NewPrometheusMeterProvider(registry)
@@ -23,7 +27,7 @@ func newPrometheusAggregator(t *testing.T) (*Aggregator, *prometheus.Registry) {
 	return NewAggregator(provider.Meter("test"), discardLogger), registry
 }
 
-func scrape(t *testing.T, registry *prometheus.Registry) string {
+func scrape(t testing.TB, registry *prometheus.Registry) string {
 	t.Helper()
 	srv := httptest.NewServer(promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
 	defer srv.Close()
@@ -117,5 +121,166 @@ func TestInvalidTagKeyIsNotRecordedAndScrapeSurvives(t *testing.T) {
 	assertContains(t, body, `ok_total{_k_="v"} 1`)
 	if strings.Contains(body, "bad_total") {
 		t.Errorf("/metrics has a metric with an invalid tag key:\n%s", body)
+	}
+}
+
+func seriesLine(i int) string {
+	return fmt.Sprintf("bench.c%d:1|c|#function:f%d,region:r%d,id:%d", i%4, i%10, i%3, i)
+}
+
+func populateSeries(ctx context.Context, agg *Aggregator, series int) {
+	for i := range series {
+		agg.Record(ctx, seriesLine(i))
+	}
+}
+
+func benchSeriesCount(tb testing.TB, registry *prometheus.Registry, prefix string) (count int, overflow bool) {
+	tb.Helper()
+	families, err := registry.Gather()
+	if err != nil {
+		tb.Fatalf("gather: %v", err)
+	}
+	for _, family := range families {
+		if !strings.HasPrefix(family.GetName(), prefix) {
+			continue
+		}
+		for _, m := range family.GetMetric() {
+			count++
+			for _, label := range m.GetLabel() {
+				overflow = overflow || label.GetName() == "otel_metric_overflow"
+			}
+		}
+	}
+	return count, overflow
+}
+
+func BenchmarkRecordCardinality(b *testing.B) {
+	ctx := context.Background()
+	for _, series := range []int{1, 100, 1000, 5000} {
+		b.Run(fmt.Sprintf("series_%d", series), func(b *testing.B) {
+			lines := make([]string, series)
+			for i := range lines {
+				lines[i] = fmt.Sprintf("bench.requests:1|c|#id:%d", i)
+			}
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			agg, registry := newPrometheusAggregator(b)
+			for _, line := range lines {
+				agg.Record(ctx, line)
+			}
+			runtime.GC()
+			runtime.ReadMemStats(&after)
+			runtime.KeepAlive(agg)
+			heapPerSeries := float64(int64(after.HeapAlloc)-int64(before.HeapAlloc)) / float64(min(series, cardinalityLimit))
+
+			i := 0
+			for b.Loop() {
+				agg.Record(ctx, lines[i])
+				if i++; i == len(lines) {
+					i = 0
+				}
+			}
+			if series >= 100 {
+				b.ReportMetric(heapPerSeries, "heap-B/series")
+			}
+			count, overflow := benchSeriesCount(b, registry, "bench_requests")
+			if want := min(series, cardinalityLimit); count != want || overflow != (series > cardinalityLimit) {
+				b.Fatalf("series = %d (overflow %t), want %d (overflow %t)", count, overflow, want, series > cardinalityLimit)
+			}
+		})
+	}
+}
+
+func BenchmarkScrape(b *testing.B) {
+	ctx := context.Background()
+	for _, series := range []int{10, 100, 1000, 4000} {
+		b.Run(fmt.Sprintf("series_%d", series), func(b *testing.B) {
+			agg, registry := newPrometheusAggregator(b)
+			populateSeries(ctx, agg, series)
+			if count, _ := benchSeriesCount(b, registry, "bench_"); count != series {
+				b.Fatalf("series = %d, want %d", count, series)
+			}
+
+			b.Run("gather", func(b *testing.B) {
+				for b.Loop() {
+					if _, err := registry.Gather(); err != nil {
+						b.Fatalf("gather: %v", err)
+					}
+				}
+			})
+			b.Run("handler", func(b *testing.B) {
+				handler := promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
+				req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, req)
+				if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "bench_c0_total") {
+					b.Fatalf("unexpected response, status %d:\n%s", rec.Code, rec.Body.String())
+				}
+				b.SetBytes(int64(rec.Body.Len()))
+				for b.Loop() {
+					handler.ServeHTTP(httptest.NewRecorder(), req)
+				}
+			})
+		})
+	}
+}
+
+// BenchmarkRecordWhileScraping compares ingestion alone with ingestion while a goroutine
+// scrapes back to back, which is far more often than a real Prometheus does.
+func BenchmarkRecordWhileScraping(b *testing.B) {
+	const series = 1000
+	lines := make([]string, series)
+	for i := range lines {
+		lines[i] = seriesLine(i)
+	}
+	ctx := context.Background()
+	for _, scraping := range []bool{false, true} {
+		name := "no_scrape"
+		if scraping {
+			name = "continuous_scrape"
+		}
+		b.Run(name, func(b *testing.B) {
+			agg, registry := newPrometheusAggregator(b)
+			populateSeries(ctx, agg, series)
+
+			stop := make(chan struct{})
+			var wg sync.WaitGroup
+			var scrapes atomic.Int64
+			if scraping {
+				wg.Go(func() {
+					for {
+						select {
+						case <-stop:
+							return
+						default:
+						}
+						if _, err := registry.Gather(); err != nil {
+							b.Errorf("gather: %v", err)
+							return
+						}
+						scrapes.Add(1)
+					}
+				})
+			}
+
+			var workers atomic.Int64
+			b.RunParallel(func(pb *testing.PB) {
+				i := int(workers.Add(1)) * 97
+				for pb.Next() {
+					agg.Record(ctx, lines[i%series])
+					i++
+				}
+			})
+			b.StopTimer()
+			close(stop)
+			wg.Wait()
+			if scraping {
+				b.ReportMetric(float64(scrapes.Load())/b.Elapsed().Seconds(), "scrapes/s")
+			}
+			if count, _ := benchSeriesCount(b, registry, "bench_"); count != series {
+				b.Fatalf("series = %d, want %d", count, series)
+			}
+		})
 	}
 }

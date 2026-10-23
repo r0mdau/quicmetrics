@@ -15,6 +15,7 @@
 
 ```sh
 make check                          # fmt, vet, golangci-lint v2, test -race: run before you finish
+make bench                          # benchmarks, not part of check; compare runs with benchstat
 make vuln                           # govulncheck
 make compose-up / compose-down      # server + Prometheus in Docker
 go run ./cmd/quicmetrics            # QUIC on localhost:4242/udp, metrics on :2223
@@ -80,6 +81,10 @@ One client must never take the server down.
   parameters.
 - Don't add inline comments unless the logic is genuinely hard to follow. Keep existing
   comments. Exported identifiers and packages need godoc.
+- Benchmarks sit beside the code they measure, use `b.Loop()` and the `testing.TB` helpers,
+  and assert their result once after the loop so they never time an error path.
+  `TestRecordAllocations` pins the allocations of `Aggregator.Record`: lower the budget when
+  you remove allocations, and justify raising it.
 - Avoid new dependencies. Never commit `build/` or binaries.
 
 ## Review large changes

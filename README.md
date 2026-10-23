@@ -102,6 +102,14 @@ Other runs:
     make check   # fmt, vet, golangci-lint, tests with -race
     make vuln    # govulncheck
     make build   # binaries in build/
+    make bench   # benchmarks with allocation stats
+
+`make bench` runs every benchmark in `internal/server` (parsing, recording, cardinality,
+Prometheus scrapes, QUIC sessions). Run a subset with
+`go test -run '^$' -bench Scrape -benchmem ./internal/server`. To compare two versions, save
+each run with `go test -run '^$' -bench . -benchmem -count 10 ./... > old.txt` (then `new.txt`)
+and run [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat) `old.txt new.txt`.
+CI runs each benchmark once to keep them compiling and passing, not to time them.
 
 `make lint` needs [golangci-lint](https://golangci-lint.run/welcome/install/) v2
 (CI pins v2.15.0).
