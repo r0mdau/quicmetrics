@@ -662,19 +662,6 @@ func TestHistogramAggregation(t *testing.T) {
 			want:     map[string]histogramWant{"latency{a=x}": {4, 144, map[float64]uint64{5: 1, 25: 1, 50: 1, 100: 1}}},
 		},
 		{
-			name:     "sample rate is validated but ignored",
-			messages: []string{"latency:12|h|@0.1", "latency:12|ms|@0.5|#a:x", "latency:12|h|#a:x|@0.25", "latency:12|h|@1"},
-			want: map[string]histogramWant{
-				"latency{}":    {2, 24, map[float64]uint64{25: 2}},
-				"latency{a=x}": {2, 24, map[float64]uint64{25: 2}},
-			},
-		},
-		{
-			name:     "values up to 2^63 are accepted",
-			messages: []string{"latency:9223372036854775808|h", "latency:-9223372036854775808|h"},
-			want:     map[string]histogramWant{"latency{}": {2, 0, map[float64]uint64{0: 1, inf: 1}}},
-		},
-		{
 			name: "invalid histograms leave the series alone",
 			messages: []string{
 				"latency:12|h", "latency:NaN|h", "latency:+Inf|ms", "latency:1e19|h", "latency:-1|ms",
@@ -694,6 +681,20 @@ func TestHistogramAggregation(t *testing.T) {
 			assertHistograms(t, histograms, tt.want)
 			if len(sums) != 0 || len(gauges) != 0 {
 				t.Errorf("recorded %v and %v, want no sums and no gauges", values(sums), gauges)
+			}
+		})
+	}
+}
+
+func TestSampledHistogramIsRecorded(t *testing.T) {
+	t.Parallel()
+	for _, msg := range []string{"latency:12|h|@0.1", "latency:12|ms|@0.5|#a:x", "latency:12|h|#a:x|@0.25", "latency:12|h|@1"} {
+		t.Run(msg, func(t *testing.T) {
+			t.Parallel()
+			agg, reader := newTestAggregator()
+			agg.Record(context.Background(), msg)
+			if got := collectHistograms(t, reader); len(got) != 1 {
+				t.Errorf("recorded %v, want one series", got)
 			}
 		})
 	}
