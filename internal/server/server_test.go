@@ -129,6 +129,8 @@ func TestEchoWriterEchoesInput(t *testing.T) {
 		"users.online:1|c|#country:france",
 		"temperature:21.5|g",
 		"latency:12|h",
+		"latency:12|ms",
+		"users.unique:alice|s",
 		"not a metric",
 		"",
 		"foo:1|c|",

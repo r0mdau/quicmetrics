@@ -123,6 +123,89 @@ func TestPrometheusGaugeExposition(t *testing.T) {
 	}
 }
 
+func TestPrometheusHistogramExposition(t *testing.T) {
+	t.Parallel()
+	agg, registry := newPrometheusAggregator(t)
+	for _, msg := range []string{
+		"request.time:3|h|#route:a",
+		"request.time:5|ms|#route:a",
+		"request.time:60|h|@0.5|#route:a",
+		"request.time:-2|h|#route:b",
+	} {
+		agg.Record(context.Background(), msg)
+	}
+
+	body := scrape(t, registry)
+	assertContains(t, body,
+		"# HELP request_time a simple histogram",
+		"# TYPE request_time histogram",
+		`request_time_bucket{route="a",le="0"} 0`,
+		`request_time_bucket{route="a",le="5"} 2`,
+		`request_time_bucket{route="a",le="10"} 2`,
+		`request_time_bucket{route="a",le="75"} 3`,
+		`request_time_bucket{route="a",le="10000"} 3`,
+		`request_time_bucket{route="a",le="+Inf"} 3`,
+		`request_time_sum{route="a"} 68`,
+		`request_time_count{route="a"} 3`,
+		`request_time_bucket{route="b",le="0"} 1`,
+		`request_time_sum{route="b"} -2`,
+		`request_time_count{route="b"} 1`,
+	)
+	for _, unwanted := range []string{"request_time_total", "request_time_milliseconds", "request_time_ms", "otel_scope_"} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("/metrics has %q:\n%s", unwanted, body)
+		}
+	}
+}
+
+// TestHistogramCollisionsKeepScrapesWorking pins what happens when a histogram shares a
+// Prometheus name with another instrument. A histogram foo exposes the family foo and the
+// series foo_bucket, foo_sum and foo_count. A gauge foo or foo.count then collides with it,
+// and a counter foo (foo_total) does not. Which side of a collision is exposed depends on the
+// order, so only the rest of the scrape is asserted, with ContinueOnError as configured in
+// cmd/quicmetrics.
+func TestHistogramCollisionsKeepScrapesWorking(t *testing.T) {
+	t.Parallel()
+	continueOnError := promhttp.HandlerOpts{ErrorHandling: promhttp.ContinueOnError}
+
+	t.Run("counter with the same name coexists", func(t *testing.T) {
+		t.Parallel()
+		agg, registry := newPrometheusAggregator(t)
+		for _, msg := range []string{"foo:1|c", "foo:2|h", "foo:3|c", "foo:4|ms"} {
+			agg.Record(context.Background(), msg)
+		}
+		assertContains(t, scrape(t, registry),
+			"# TYPE foo histogram", "foo_sum 6", "foo_count 2",
+			"# TYPE foo_total counter", "foo_total 4",
+		)
+	})
+
+	for _, tt := range []struct {
+		name  string
+		order []string
+	}{
+		{"gauge with the same name, histogram first", []string{"foo:1|h", "foo:2|g"}},
+		{"gauge with the same name, gauge first", []string{"foo:2|g", "foo:1|h"}},
+		{"gauge named like the count, histogram first", []string{"foo:1|h", "foo.count:2|g"}},
+		{"gauge named like the count, gauge first", []string{"foo.count:2|g", "foo:1|h"}},
+		{"gauge named like the sum, histogram first", []string{"foo:1|h", "foo.sum:2|g"}},
+		{"counter named like the bucket, histogram first", []string{"foo:1|h", "foo.bucket:2|c"}},
+		{"timer and gauge with the same name", []string{"foo:1|ms", "foo:2|g"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			agg, registry := newPrometheusAggregator(t)
+			for _, msg := range tt.order {
+				agg.Record(context.Background(), msg)
+			}
+			agg.Record(context.Background(), "ok:1|c")
+			agg.Record(context.Background(), "ok.time:1|h")
+
+			assertContains(t, scrapeWith(t, registry, continueOnError), "ok_total 1", "ok_time_count 1")
+		})
+	}
+}
+
 // TestCounterAndGaugeWithTheSameNameKeepScrapesWorking pins what the exporter does when a
 // counter and a gauge want the same Prometheus name. The names foo (gauge) and foo_total
 // (counter) are different families and coexist. foo.total as a gauge collides with the foo
@@ -244,12 +327,22 @@ func benchSeriesCount(tb testing.TB, registry *prometheus.Registry, prefix strin
 }
 
 func BenchmarkRecordCardinality(b *testing.B) {
+	benchRecordCardinality(b, "bench.requests:1|c|#id:%d", "bench_requests")
+}
+
+func BenchmarkRecordHistogramCardinality(b *testing.B) {
+	benchRecordCardinality(b, "bench.latency:12|h|#id:%d", "bench_latency")
+}
+
+// benchRecordCardinality records format, which takes the series id, for 1 to 5000 series and
+// reports the heap per series the exporter holds at the cardinality limit.
+func benchRecordCardinality(b *testing.B, format, family string) {
 	ctx := context.Background()
 	for _, series := range []int{1, 100, 1000, 5000} {
 		b.Run(fmt.Sprintf("series_%d", series), func(b *testing.B) {
 			lines := make([]string, series)
 			for i := range lines {
-				lines[i] = fmt.Sprintf("bench.requests:1|c|#id:%d", i)
+				lines[i] = fmt.Sprintf(format, i)
 			}
 			var before, after runtime.MemStats
 			runtime.GC()
@@ -273,7 +366,7 @@ func BenchmarkRecordCardinality(b *testing.B) {
 			if series >= 100 {
 				b.ReportMetric(heapPerSeries, "heap-B/series")
 			}
-			count, overflow := benchSeriesCount(b, registry, "bench_requests")
+			count, overflow := benchSeriesCount(b, registry, family)
 			if want := min(series, cardinalityLimit); count != want || overflow != (series > cardinalityLimit) {
 				b.Fatalf("series = %d (overflow %t), want %d (overflow %t)", count, overflow, want, series > cardinalityLimit)
 			}
