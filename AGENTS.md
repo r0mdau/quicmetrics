@@ -63,8 +63,8 @@ go run ./cmd/quicmetrics-client     # generate counters for 10s (see -h for flag
   float64 value.
 - A counter and a gauge with the same name coexist when their Prometheus names differ (`foo|c`
   is `foo_total`, `foo|g` is `foo`). `foo.total|g` collides with `foo|c`: the exporter logs
-  `instrument type conflict` and one of the two series (which one varies between runs) is
-  missing from `/metrics`; a plain `promhttp` handler would answer HTTP 500, so keep
+  `instrument type conflict` and only the series of the first instrument created is exposed
+  (which one that is depends on the order sessions send them); a plain `promhttp` handler would answer HTTP 500, so keep
   `ContinueOnError`. `TestCounterAndGaugeWithTheSameNameKeepScrapesWorking` pins this.
 - Metric names must be valid OTel instrument names (start with a letter, then
   `[A-Za-z0-9_.-/]`, up to 255 characters). Other names are logged and dropped.
@@ -94,7 +94,10 @@ One client must never take the server down.
 - Negative counter values are recorded, so a counter can go down (Prometheus reads that as
   a reset).
 - Each counter and gauge keeps at most 2000 tag sets (`NewPrometheusMeterProvider`). Beyond that,
-  values go to a single `otel_metric_overflow="true"` series.
+  values go to a single `otel_metric_overflow="true"` series: a sum for a counter, the last
+  overflowing value for a gauge.
+- A gauge keeps its last value on `/metrics` forever after the client stops sending it: there
+  is no staleness or expiry.
 
 ## Conventions
 

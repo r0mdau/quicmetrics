@@ -126,8 +126,9 @@ func TestPrometheusGaugeExposition(t *testing.T) {
 // TestCounterAndGaugeWithTheSameNameKeepScrapesWorking pins what the exporter does when a
 // counter and a gauge want the same Prometheus name. The names foo (gauge) and foo_total
 // (counter) are different families and coexist. foo.total as a gauge collides with the foo
-// counter: one of the two is dropped (which one varies between runs), the exporter logs the conflict, and promhttp
-// ContinueOnError, as configured in cmd/quicmetrics, keeps the rest of the scrape working.
+// counter: only the first instrument created is exposed, the exporter logs the conflict, and
+// promhttp ContinueOnError, as configured in cmd/quicmetrics, keeps the rest of the scrape
+// working.
 // Without ContinueOnError the collision is an HTTP 500, like the foo and foo.total counters.
 func TestCounterAndGaugeWithTheSameNameKeepScrapesWorking(t *testing.T) {
 	t.Parallel()
