@@ -65,14 +65,15 @@ Client flags:
 The client sends four counters, tagged by `function` and `region`: `faas.invocations`
 (with `cold_start`), `http.requests` (with `method` and `status`), `faas.billed.ms` and
 `faas.errors` (with `error`). A few functions get most of the traffic, most requests succeed,
-and errors stay rare. It also sends two gauges on about 15% of the lines, tagged by `function`
+and errors stay rare. It also sends two gauges on about 13% of the lines, tagged by `function`
 and `region`: `faas.concurrency`, the in-flight executions (a whole number that drifts by at
 most one between samples of a series) and `faas.memory.utilization`, a ratio from 0 to 1.
 Two histograms take another 15% of the lines, with long-tailed values in milliseconds:
 `faas.duration` (`|h`, tagged by `function` and `region`), the execution time, mostly tens to
-hundreds of ms with a tail into seconds and slower cold starts, and `http.latency` (`|ms`,
-also tagged by `method`), the request latency. With all 10 functions, `http.requests` has at
-most 600 tag sets, well under the server's limit of 2000 per counter, gauge or histogram.
+hundreds of ms with a tail into seconds and 5% of slow executions (4 times longer), and
+`http.latency` (`|ms`, also tagged by `method`), the request latency. With all 10 functions,
+`http.requests` has at most 600 tag sets, well under the server's limit of 2000 per counter,
+gauge or histogram.
 
 A counter adds up, so Prometheus exposes it with a `_total` suffix. A gauge (`|g`) keeps only
 the last value received for each series and is exposed as is, without `_total`. A gauge value

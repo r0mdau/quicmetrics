@@ -84,8 +84,8 @@ func TestGeneratorEmitsCountersGaugesAndHistogramsInRange(t *testing.T) {
 		t.Errorf("generated %v, want all four counters, both gauges and both histograms", seen)
 	}
 	gauges := seen["faas.concurrency"] + seen["faas.memory.utilization"]
-	if gauges < lines*10/100 || gauges > lines*20/100 {
-		t.Errorf("%d of %d lines are gauges, want about 15%%", gauges, lines)
+	if gauges < lines*10/100 || gauges > lines*16/100 {
+		t.Errorf("%d of %d lines are gauges, want about 13%%", gauges, lines)
 	}
 	histograms := seen["faas.duration"] + seen["http.latency"]
 	if histograms < lines*12/100 || histograms > lines*18/100 {
