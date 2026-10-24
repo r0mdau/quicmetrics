@@ -91,7 +91,7 @@ but never scales a histogram: `_count` and `_sum` only cover the values actually
 ### Client examples
 
 Send 400 metrics at 200 per second across 4 functions. With a fixed seed, a fresh server
-always ends up with the same 81 counter series (and 20 gauge series):
+always ends up with the same 81 counter series (plus 20 gauge series and 24 histogram series):
 
     $ go run ./cmd/quicmetrics-client -rate 200 -count 400 -functions 4 -seed 7
     level=INFO msg="generating metrics" addr=localhost:4242 seed=7 rate=200 count=400 duration=10s functions=4
@@ -99,7 +99,7 @@ always ends up with the same 81 counter series (and 20 gauge series):
 
     $ curl -s localhost:2223/metrics | grep -E '^(faas|http)'
     ...
-    faas_billed_ms_total{function="checkout",region="eu-west-1"} 366
+    faas_billed_ms_total{function="checkout",region="eu-west-1"} 1648
     faas_errors_total{error="timeout",function="checkout",region="us-east-1"} 3
     faas_invocations_total{cold_start="false",function="checkout",region="us-east-1"} 84
     http_requests_total{function="checkout",method="GET",region="us-east-1",status="200"} 125
