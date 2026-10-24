@@ -28,6 +28,11 @@ import (
 // Gauge values are returned as the parser read them, as float64. They must be finite, since
 // nothing is summed there is no other bound, and a sign (+3, -3) is part of the absolute value.
 // The sample rate must be in (0, 1] like for counters, but it is not applied to the value.
+//
+// Histogram (h) and timer (ms) values are returned as float64. They must be numbers of at most
+// 2^63 in magnitude like counters, since the sum of a histogram accumulates them, and may be
+// negative except for timers, which the parser rejects. The sample rate is validated like for
+// gauges and not applied to the value.
 func Parse(raw string) (*dogstatsd.Metric, error) {
 	if !utf8.ValidString(raw) {
 		return nil, errors.New("metric is not valid UTF-8")
@@ -48,6 +53,10 @@ func Parse(raw string) (*dogstatsd.Metric, error) {
 		}
 	case dogstatsd.Gauge:
 		if err := checkGauge(m, raw); err != nil {
+			return nil, err
+		}
+	case dogstatsd.Histogram, dogstatsd.Timer:
+		if err := checkHistogram(m, raw); err != nil {
 			return nil, err
 		}
 	}
@@ -96,6 +105,18 @@ func checkGauge(m *dogstatsd.Metric, raw string) error {
 	return err
 }
 
+// checkHistogram validates a histogram or timer that dogstatsd.Parse already accepted: its
+// value must be a number of at most 2^63 in magnitude and its sample rate valid, although the
+// rate is not applied.
+func checkHistogram(m *dogstatsd.Metric, raw string) error {
+	if v, ok := m.Value.(float64); !ok || math.IsNaN(v) || math.Abs(v) > maxCounterValue {
+		return fmt.Errorf("histogram value %v is not a number of at most 2^63 in magnitude", m.Value)
+	}
+	_, tail := valueAndTail(raw)
+	_, err := sampleRate(tail)
+	return err
+}
+
 // valueAndTail splits a line that dogstatsd.Parse already accepted into the raw value and
 // the segments that follow the value.
 func valueAndTail(raw string) (value, tail string) {
@@ -127,11 +148,12 @@ func sampleRate(tail string) (float64, error) {
 	return rate, nil
 }
 
-// maxCounterValue bounds each counter value so that summing them can't realistically
-// overflow to +Inf, which would stick to the series as much as a NaN.
+// maxCounterValue bounds each counter and histogram value so that summing them can't
+// realistically overflow to +Inf, which would stick to the series as much as a NaN.
 const maxCounterValue = 1 << 63
 
-// Aggregator records DogStatsD counters and gauges as OpenTelemetry instruments.
+// Aggregator records DogStatsD counters, gauges, histograms and timers as OpenTelemetry
+// instruments. Histograms and timers share one Float64Histogram per name.
 type Aggregator struct {
 	meter  metric.Meter
 	logger *slog.Logger
@@ -142,8 +164,8 @@ func NewAggregator(meter metric.Meter, logger *slog.Logger) *Aggregator {
 	return &Aggregator{meter: meter, logger: logger}
 }
 
-// Record parses raw and records it when it is a counter or a gauge. Invalid lines and other
-// metric types are logged and dropped.
+// Record parses raw and records it when it is a counter, a gauge, a histogram or a timer.
+// Invalid lines and other metric types are logged and dropped.
 func (a *Aggregator) Record(ctx context.Context, raw string) {
 	a.logger.Debug("metric received", "raw", raw)
 
@@ -157,6 +179,8 @@ func (a *Aggregator) Record(ctx context.Context, raw string) {
 		a.recordCounter(ctx, m)
 	case dogstatsd.Gauge:
 		a.recordGauge(ctx, m)
+	case dogstatsd.Histogram, dogstatsd.Timer:
+		a.recordHistogram(ctx, m)
 	default:
 		a.logger.Debug("metric type not aggregated", "raw", raw, "type", string(m.Type))
 	}
@@ -203,6 +227,25 @@ func (a *Aggregator) recordGauge(ctx context.Context, m *dogstatsd.Metric) {
 		return
 	}
 	gauge.Record(ctx, value, metric.WithAttributes(attrs...))
+}
+
+func (a *Aggregator) recordHistogram(ctx context.Context, m *dogstatsd.Metric) {
+	value, ok := m.Value.(float64)
+	if !ok {
+		a.logger.Warn("unsupported histogram value", "name", m.Name, "type", fmt.Sprintf("%T", m.Value))
+		return
+	}
+
+	attrs, ok := a.attributes(m)
+	if !ok {
+		return
+	}
+	histogram, err := a.meter.Float64Histogram(m.Name, metric.WithDescription("a simple histogram"))
+	if err != nil {
+		a.logger.Warn("create histogram", "name", m.Name, "err", err)
+		return
+	}
+	histogram.Record(ctx, value, metric.WithAttributes(attrs...))
 }
 
 // attributes turns the tags of m into attributes. It logs and reports false when a tag key
