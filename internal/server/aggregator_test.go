@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"math/rand/v2"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -93,6 +94,23 @@ func TestParse(t *testing.T) {
 		{name: "negative infinite counter", raw: "foo:-Inf|c", wantErr: true},
 		{name: "counter above 2^63", raw: "foo:1e19|c", wantErr: true},
 		{name: "counter below -2^63", raw: "foo:-1e19|c", wantErr: true},
+		{name: "sampled counter", raw: "foo:1|c|@0.1|#a:b"},
+		{name: "sample rate 1", raw: "foo:1|c|@1"},
+		{name: "sample rate 0", raw: "foo:1|c|@0", wantErr: true},
+		{name: "sample rate 0 on a zero counter", raw: "foo:0|c|@0", wantErr: true},
+		{name: "negative zero sample rate", raw: "foo:1|c|@-0", wantErr: true},
+		{name: "NaN sample rate", raw: "foo:1|c|@NaN", wantErr: true},
+		{name: "infinite sample rate", raw: "foo:1|c|@+Inf", wantErr: true},
+		{name: "sample rate above 1", raw: "foo:1|c|@1.5", wantErr: true},
+		{name: "negative sample rate", raw: "foo:1|c|@-0.5", wantErr: true},
+		{name: "sample rate not a number", raw: "foo:1|c|@abc", wantErr: true},
+		{name: "empty sample rate", raw: "foo:1|c|@", wantErr: true},
+		{name: "later sample rate 0 after a valid one", raw: "foo:1|c|@0.5|@0", wantErr: true},
+		{name: "sample rate after tags", raw: "foo:1|c|#a:b|@0", wantErr: true},
+		{name: "sample rate underflowing float32", raw: "foo:1|c|@1e-50", wantErr: true},
+		{name: "smallest sample rate overflows the sum", raw: "foo:1|c|@5e-324", wantErr: true},
+		{name: "scaled counter above 2^63", raw: "foo:1e18|c|@0.01", wantErr: true},
+		{name: "scaled counter below -2^63", raw: "foo:-1e18|c|@0.01", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -122,9 +140,20 @@ func TestParseCounterValue(t *testing.T) {
 	}{
 		{raw: "foo:1|c", want: 1},
 		{raw: "foo:1.5|c", want: 1.5},
-		{raw: "foo:0.25|c|@0.5|#a:b", want: 0.25},
+		{raw: "foo:0.25|c|@0.5|#a:b", want: 0.5},
 		{raw: "foo:1e-3|c", want: 0.001},
 		{raw: "foo:9223372036854775808|c", want: 1 << 63},
+		{raw: "foo:1|c|@0.1", want: 10},
+		{raw: "foo:3|c|@0.3", want: 10},
+		{raw: "foo:1|c|@0.01", want: 100},
+		{raw: "foo:1|c|@0.5", want: 2},
+		{raw: "foo:1|c|@1", want: 1},
+		{raw: "foo:1.5|c|@0.25", want: 6},
+		{raw: "foo:-3|c|@0.5", want: -6},
+		{raw: "foo:0|c|@0.1", want: 0},
+		{raw: "foo:4|c|#a:b|@0.5", want: 8},
+		{raw: "foo:1|c|@0.5|@0.25", want: 4},
+		{raw: "foo:4611686018427387904|c|@0.5", want: 1 << 63},
 	}
 	for _, tt := range tests {
 		t.Run(tt.raw, func(t *testing.T) {
@@ -175,6 +204,31 @@ func TestCounterAggregation(t *testing.T) {
 			name:     "fractional values are kept",
 			messages: []string{"foo:1.5|c", "foo:0.25|c"},
 			want:     map[string]float64{"foo{}": 1.75},
+		},
+		{
+			name:     "sampled counter is scaled by 1/rate",
+			messages: []string{"foo:1|c|@0.1"},
+			want:     map[string]float64{"foo{}": 10},
+		},
+		{
+			name:     "sample rate applies to the value and keeps the tags",
+			messages: []string{"foo:2|c|@0.5|#a:x", "foo:3|c|#a:x|@0.25"},
+			want:     map[string]float64{"foo{a=x}": 16},
+		},
+		{
+			name:     "sampled and unsampled counters share a series",
+			messages: []string{"foo:1|c|@0.1", "foo:1|c", "foo:1|c|@1"},
+			want:     map[string]float64{"foo{}": 12},
+		},
+		{
+			name:     "many sampled events add up to the real count",
+			messages: slices.Repeat([]string{"foo:1|c|@0.1"}, 100),
+			want:     map[string]float64{"foo{}": 1000},
+		},
+		{
+			name:     "invalid sample rates drop the metric and leave the series alone",
+			messages: []string{"foo:1|c", "foo:1|c|@0", "foo:1|c|@NaN", "foo:1|c|@1e-50", "foo:1e18|c|@0.01", "foo:1|c|@2"},
+			want:     map[string]float64{"foo{}": 1},
 		},
 		{
 			name: "different tag sets are separate series",
@@ -242,6 +296,14 @@ func TestIgnoredInputRecordsNothing(t *testing.T) {
 		"foo@bar:1|c",
 		"foo:1|c|#_:v",
 		"foo:1|c|#__name__:x",
+		"foo:1|c|@0",
+		"foo:1|c|@NaN",
+		"foo:1|c|@-0.5",
+		"foo:1|c|@1.5",
+		"foo:1|c|@abc",
+		"foo:1|c|@1e-50",
+		"foo:1e18|c|@0.01",
+		"temperature:21.5|g|@0",
 		"",
 	} {
 		t.Run(msg, func(t *testing.T) {
@@ -420,6 +482,8 @@ func TestRecordAllocations(t *testing.T) {
 		{"counter_4_tags", taggedLine(4), 14},
 		// One more than an integer: Parse boxes the float64 that replaces the parser's int64.
 		{"float_counter_4_tags", strings.Replace(taggedLine(4), ":1|", ":1.5|", 1), 15},
+		// Parse boxes the scaled float64 just like a fractional value.
+		{"sampled_counter_4_tags", strings.Replace(taggedLine(4), ":1|c", ":1|c|@0.1", 1), 15},
 		{"gauge_dropped", "bench.temperature:21.5|g", 7},
 	}
 	for _, tt := range tests {
