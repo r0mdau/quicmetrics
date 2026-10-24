@@ -46,6 +46,13 @@ go run ./cmd/quicmetrics-client     # generate counters for 10s (see -h for flag
 - Counter values are recorded as float64 (`1.5` stays `1.5`). `NaN` and values above 2^63
   in magnitude (including `±Inf`) are logged and dropped: the SDK sums them unchecked, and a
   `NaN` or `Inf` sum would stick to the series forever.
+- Sample rates: `foo:1|c|@0.1` records `1/0.1 = 10`. `server.Parse` reads the rate from the raw
+  line as float64 (the parser's float32 would give 9.99999985), divides the value by it, and
+  returns the scaled value. `Metric.Rate` is left as parsed and must not be applied again. A
+  rate outside (0, 1] is logged and the metric dropped: `dogstatsd.Parse` lets `@0` and `@NaN`
+  through, and dividing by them gives `Inf` or `NaN`. The 2^63 bound applies to the scaled value
+  too (`@1e-50` and `@5e-324` overflow it), and a rate that underflows float32 is judged by its
+  float64 value.
 - Metric names must be valid OTel instrument names (start with a letter, then
   `[A-Za-z0-9_.-/]`, up to 255 characters). Other names are logged and dropped.
 - Tag keys need an ASCII letter or digit and must not start with `__`, otherwise the whole
@@ -60,7 +67,7 @@ One client must never take the server down.
 - Always parse with `server.Parse`, never `dogstatsd.Parse`. It recovers the parser's panic on
   empty segments (`foo:1|c|`) and rejects invalid UTF-8, which would otherwise make every
   later scrape log an error and drop the series (HTTP 500 without `ContinueOnError`). It also
-  re-parses counter values, which `dogstatsd.Parse` truncates to `int64`.
+  re-parses counter values, which `dogstatsd.Parse` truncates to `int64`, and sample rates.
 - client_golang recovers panics in collectors, but a panic still drops every OTel series on
   every scrape. Validate any new client-controlled data before it reaches OTel.
 - `/metrics` uses `promhttp.ContinueOnError`: colliding series (e.g. `a.b` and `a_b`, or `foo`
@@ -68,7 +75,6 @@ One client must never take the server down.
 
 ## Known quirks (not yet fixed)
 
-- Sample rates are ignored.
 - Negative counter values are recorded, so a counter can go down (Prometheus reads that as
   a reset).
 - Each counter keeps at most 2000 tag sets (`NewPrometheusMeterProvider`). Beyond that,
