@@ -152,8 +152,10 @@ func TestGeneratorMetricsAreRecordedAndExposedWithoutErrors(t *testing.T) {
 		t.Fatalf("gather: %v", err)
 	}
 	names := map[string]bool{}
+	types := map[string]string{}
 	for _, f := range families {
 		names[f.GetName()] = true
+		types[f.GetName()] = f.GetType().String()
 		for _, m := range f.GetMetric() {
 			for _, l := range m.GetLabel() {
 				if l.GetName() == "otel_metric_overflow" {
@@ -173,6 +175,14 @@ func TestGeneratorMetricsAreRecordedAndExposedWithoutErrors(t *testing.T) {
 	} {
 		if !names[want] {
 			t.Errorf("missing series %s", want)
+		}
+	}
+	for _, want := range []string{"faas_duration", "http_latency"} {
+		if types[want] != "HISTOGRAM" {
+			t.Errorf("family %s has type %q, want HISTOGRAM", want, types[want])
+		}
+		if names[want+"_total"] {
+			t.Errorf("histogram exposed as %s_total, want no _total suffix", want)
 		}
 	}
 }

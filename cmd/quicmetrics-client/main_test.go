@@ -44,7 +44,7 @@ func TestSendMetricsDeliversGeneratedMetrics(t *testing.T) {
 	if !maps.Equal(got, want) {
 		t.Fatalf("got %v\nwant %v", got, want)
 	}
-	for _, name := range []string{"faas.concurrency", "faas.memory.utilization"} {
+	for _, name := range []string{"faas.concurrency", "faas.memory.utilization", "faas.duration", "http.latency"} {
 		if !slices.ContainsFunc(slices.Collect(maps.Keys(got)), func(series string) bool { return strings.HasPrefix(series, name+"{") }) {
 			t.Errorf("server recorded no %s series", name)
 		}
