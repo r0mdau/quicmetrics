@@ -88,6 +88,11 @@ func TestParse(t *testing.T) {
 		{name: "invalid UTF-8 name", raw: "foo\xff:1|c", wantErr: true},
 		{name: "invalid UTF-8 tag", raw: "foo:1|c|#k:v\xff", wantErr: true},
 		{name: "garbage", raw: "garbage", wantErr: true},
+		{name: "NaN counter", raw: "foo:NaN|c", wantErr: true},
+		{name: "infinite counter", raw: "foo:+Inf|c", wantErr: true},
+		{name: "negative infinite counter", raw: "foo:-Inf|c", wantErr: true},
+		{name: "counter above 2^63", raw: "foo:1e19|c", wantErr: true},
+		{name: "counter below -2^63", raw: "foo:-1e19|c", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -104,6 +109,41 @@ func TestParse(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatalf("Parse(%q): %v", tt.raw, err)
+			}
+		})
+	}
+}
+
+func TestParseCounterValue(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		raw  string
+		want float64
+	}{
+		{raw: "foo:1|c", want: 1},
+		{raw: "foo:1.5|c", want: 1.5},
+		{raw: "foo:0.25|c|@0.5|#a:b", want: 0.25},
+		{raw: "foo:1e-3|c", want: 0.001},
+		{raw: "foo:9223372036854775808|c", want: 1 << 63},
+	}
+	for _, tt := range tests {
+		t.Run(tt.raw, func(t *testing.T) {
+			t.Parallel()
+			m, err := Parse(tt.raw)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tt.raw, err)
+			}
+			var got float64
+			switch v := m.Value.(type) {
+			case int64:
+				got = float64(v)
+			case float64:
+				got = v
+			default:
+				t.Fatalf("Parse(%q) value = %v (%T), want a number", tt.raw, m.Value, m.Value)
+			}
+			if got != tt.want {
+				t.Errorf("Parse(%q) value = %v, want %v", tt.raw, got, tt.want)
 			}
 		})
 	}
@@ -130,6 +170,11 @@ func TestCounterAggregation(t *testing.T) {
 			name:     "same series accumulates",
 			messages: []string{"foo:1|c|#a:x", "foo:2|c|#a:x", "foo:3|c|#a:x"},
 			want:     map[string]float64{"foo{a=x}": 6},
+		},
+		{
+			name:     "fractional values are kept",
+			messages: []string{"foo:1.5|c", "foo:0.25|c"},
+			want:     map[string]float64{"foo{}": 1.75},
 		},
 		{
 			name: "different tag sets are separate series",
@@ -189,6 +234,9 @@ func TestIgnoredInputRecordsNothing(t *testing.T) {
 		"garbage",
 		"foo:1",
 		"foo:abc|c",
+		"foo:NaN|c",
+		"foo:Inf|c",
+		"foo:1e308|c",
 		"foo:1|x",
 		"9lives:1|c",
 		"foo@bar:1|c",
@@ -370,6 +418,8 @@ func TestRecordAllocations(t *testing.T) {
 		maxAllocs float64
 	}{
 		{"counter_4_tags", taggedLine(4), 14},
+		// One more than an integer: Parse boxes the float64 that replaces the parser's int64.
+		{"float_counter_4_tags", strings.Replace(taggedLine(4), ":1|", ":1.5|", 1), 15},
 		{"gauge_dropped", "bench.temperature:21.5|g", 7},
 	}
 	for _, tt := range tests {

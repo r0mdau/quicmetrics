@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -15,11 +17,31 @@ import (
 
 // Parse parses a single DogStatsD line. Unlike dogstatsd.Parse it never panics, and it
 // rejects input that is not valid UTF-8 because client_golang rejects such label values, which
-// would break every later scrape.
-func Parse(raw string) (m *dogstatsd.Metric, err error) {
+// would break every later scrape. Counter values must be numbers of at most 2^63 in magnitude,
+// since a NaN or infinite sum would stick to the series forever. They are not truncated:
+// values that don't fit an int64 exactly, such as 1.5, are returned as float64.
+func Parse(raw string) (*dogstatsd.Metric, error) {
 	if !utf8.ValidString(raw) {
 		return nil, errors.New("metric is not valid UTF-8")
 	}
+	m, err := parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	if m.Type == dogstatsd.Counter {
+		v, err := counterValue(raw)
+		if err != nil {
+			return nil, err
+		}
+		// Keeping the parser's int64 when it is exact avoids boxing a second value.
+		if i, ok := m.Value.(int64); !ok || float64(i) != v {
+			m.Value = v
+		}
+	}
+	return m, nil
+}
+
+func parse(raw string) (m *dogstatsd.Metric, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			m, err = nil, fmt.Errorf("parser panic: %v", r)
@@ -27,6 +49,24 @@ func Parse(raw string) (m *dogstatsd.Metric, err error) {
 	}()
 	return dogstatsd.Parse(raw)
 }
+
+// counterValue parses the value of a counter line that dogstatsd.Parse already accepted.
+func counterValue(raw string) (float64, error) {
+	_, rest, _ := strings.Cut(raw, ":")
+	s, _, _ := strings.Cut(rest, "|")
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse counter value: %w", err)
+	}
+	if math.IsNaN(v) || math.Abs(v) > maxCounterValue {
+		return 0, fmt.Errorf("counter value %q is not a number of at most 2^63 in magnitude", s)
+	}
+	return v, nil
+}
+
+// maxCounterValue bounds each counter value so that summing them can't realistically
+// overflow to +Inf, which would stick to the series as much as a NaN.
+const maxCounterValue = 1 << 63
 
 // Aggregator records DogStatsD counters as OpenTelemetry instruments.
 type Aggregator struct {
