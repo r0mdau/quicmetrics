@@ -43,6 +43,9 @@ go run ./cmd/quicmetrics-client     # generate counters for 10s (see -h for flag
   each echo before sending the next metric. Several metrics in one read fail to parse.
 - Only counters (`|c`) are recorded, with tags as attributes. Invalid lines are logged as
   warnings, and other metric types at debug level. Both are echoed, but not recorded.
+- Counter values are recorded as float64 (`1.5` stays `1.5`). `NaN` and values above 2^63
+  in magnitude (including `±Inf`) are logged and dropped: the SDK sums them unchecked, and a
+  `NaN` or `Inf` sum would stick to the series forever.
 - Metric names must be valid OTel instrument names (start with a letter, then
   `[A-Za-z0-9_.-/]`, up to 255 characters). Other names are logged and dropped.
 - Tag keys need an ASCII letter or digit and must not start with `__`, otherwise the whole
@@ -56,7 +59,8 @@ One client must never take the server down.
   logged and the metric is dropped. `handleConn` recovers panics within its own session.
 - Always parse with `server.Parse`, never `dogstatsd.Parse`. It recovers the parser's panic on
   empty segments (`foo:1|c|`) and rejects invalid UTF-8, which would otherwise make every
-  later scrape log an error and drop the series (HTTP 500 without `ContinueOnError`).
+  later scrape log an error and drop the series (HTTP 500 without `ContinueOnError`). It also
+  re-parses counter values, which `dogstatsd.Parse` truncates to `int64`.
 - client_golang recovers panics in collectors, but a panic still drops every OTel series on
   every scrape. Validate any new client-controlled data before it reaches OTel.
 - `/metrics` uses `promhttp.ContinueOnError`: colliding series (e.g. `a.b` and `a_b`, or `foo`
@@ -64,7 +68,9 @@ One client must never take the server down.
 
 ## Known quirks (not yet fixed)
 
-- Counter values are truncated to `int64` (`1.5` is recorded as `1`). Sample rates are ignored.
+- Sample rates are ignored.
+- Negative counter values are recorded, so a counter can go down (Prometheus reads that as
+  a reset).
 - Each counter keeps at most 2000 tag sets (`NewPrometheusMeterProvider`). Beyond that,
   values go to a single `otel_metric_overflow="true"` series.
 
