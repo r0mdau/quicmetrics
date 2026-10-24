@@ -68,12 +68,13 @@ and errors stay rare. It also sends two gauges on about 15% of the lines, tagged
 and `region`: `faas.concurrency`, the in-flight executions (a whole number that drifts by at
 most one between samples of a series) and `faas.memory.utilization`, a ratio from 0 to 1.
 With all 10 functions, `http.requests` has at most 600 tag sets, well under the server's limit
-of 2000 per counter.
+of 2000 per counter or gauge.
 
 A counter adds up, so Prometheus exposes it with a `_total` suffix. A gauge (`|g`) keeps only
 the last value received for each series and is exposed as is, without `_total`. A gauge value
 can be any finite number, and a leading sign is an absolute value, not a delta. A sample rate
-(`|@0.5`) is validated like for counters but never scales a gauge.
+(`|@0.5`) is validated like for counters but never scales a gauge. A gauge keeps its last value on `/metrics` after the client stops
+sending it.
 
 ### Client examples
 
