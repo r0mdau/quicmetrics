@@ -18,8 +18,10 @@ import (
 // Parse parses a single DogStatsD line. Unlike dogstatsd.Parse it never panics, and it
 // rejects input that is not valid UTF-8 because client_golang rejects such label values, which
 // would break every later scrape. Counter values must be numbers of at most 2^63 in magnitude,
-// since a NaN or infinite sum would stick to the series forever. They are not truncated:
-// values that don't fit an int64 exactly, such as 1.5, are returned as float64.
+// which keeps NaN and infinite values out, since such a sum would stick to the series forever.
+// The bound does not stop a running total of whole values from passing 2^63, see
+// maxCounterValue. Values are not truncated: values that don't fit an int64 exactly, such as
+// 1.5, are returned as float64.
 //
 // The returned counter value is already divided by the sample rate, so foo:1|c|@0.1 yields
 // 10. The scaled value obeys the same bound, and a rate outside (0, 1] is an error. Rate keeps
@@ -148,8 +150,11 @@ func sampleRate(tail string) (float64, error) {
 	return rate, nil
 }
 
-// maxCounterValue bounds each counter and histogram value so that summing them can't
-// realistically overflow to +Inf, which would stick to the series as much as a NaN.
+// maxCounterValue bounds each counter and histogram value. It keeps NaN, infinite and absurdly
+// large single values out of the sums, which would stick to the series forever. It does not
+// bound the running total: the SDK adds whole-valued floats into an int64, so a total that
+// passes 2^63 wraps negative. No per-value bound can prevent that, and it takes values far
+// beyond realistic ones.
 const maxCounterValue = 1 << 63
 
 // Aggregator records DogStatsD counters, gauges, histograms and timers as OpenTelemetry

@@ -58,14 +58,16 @@ go run ./cmd/quicmetrics-client     # generate all metric types for 10s (see -h 
   `latency_count`) with the OTel SDK default buckets `0, 5, 10, 25, 50, 75, 100, 250, 500, 750,
   1000, 2500, 5000, 7500, 10000` (milliseconds), and a value equal to a bound goes in that
   bound's bucket (`le="5"` holds 5). There are no per-metric buckets. The value must be finite
-  with a magnitude of at most 2^63 like for counters, because `_sum` accumulates: `NaN`, `±Inf`
-  and larger values are logged and dropped. A negative `|h` is accepted (it lands in `le="0"`
+  with a magnitude of at most 2^63 like for counters, which keeps `NaN`, `±Inf` and absurd
+  single values out of the accumulating `_sum` (it does not bound the running total, see the
+  known quirks): `NaN`, `±Inf` and larger values are logged and dropped. A negative `|h` is accepted (it lands in `le="0"`
   and lowers `_sum`); the parser already rejects a negative `|ms`. The sample rate is validated
   like for counters (outside (0, 1] is dropped) but not applied. Names, tag keys, UTF-8 and the
   cardinality limit follow the same rules and code paths as counters and gauges.
 - Counter values are recorded as float64 (`1.5` stays `1.5`). `NaN` and values above 2^63
   in magnitude (including `±Inf`) are logged and dropped: the SDK sums them unchecked, and a
-  `NaN` or `Inf` sum would stick to the series forever.
+  `NaN` or `Inf` sum would stick to the series forever. The bound applies to each value, not to
+  the running total (see the known quirks).
 - Sample rates: `foo:1|c|@0.1` records `1/0.1 = 10`. `server.Parse` reads the rate from the raw
   line as float64 (the parser's float32 would give 9.99999985), divides the value by it, and
   returns the scaled value. `Metric.Rate` is left as parsed and must not be applied again. A
@@ -113,14 +115,19 @@ One client must never take the server down.
   the two disappear from `/metrics`, see the protocol rules.
 - Negative counter values are recorded, so a counter can go down (Prometheus reads that as
   a reset).
+- A counter total or histogram `_sum` whose running total of whole values passes 2^63
+  (about 9.2e18) wraps negative: the SDK adds whole-valued floats into an int64
+  (`9e18|c` twice gives about -4.5e17). The per-value 2^63 bound can't prevent it. It is
+  unreachable with realistic values, causes no crash and scrapes keep working.
 - Each counter, gauge and histogram keeps at most 2000 tag sets (`NewPrometheusMeterProvider`).
   Beyond that, values go to a single `otel_metric_overflow="true"` series: a sum for a
   counter, the last overflowing value for a gauge, the merged observations for a histogram.
 - Sample rates are not applied to histograms: a sampled `latency:12|h|@0.1` adds one
   observation, so `_count` and `_sum` undercount by 1/rate. Recording a value 1/rate times
   would be unbounded work.
-- Histogram buckets are fixed to the OTel defaults, suited to milliseconds: values in seconds
-  or bytes land in a few buckets.
+- Histogram buckets are fixed: the OTel defaults are suited to milliseconds, so values in
+  seconds or bytes land in a few buckets. The bound semantics themselves (a value equal to a
+  bound goes in that bound's bucket) are documented behaviour, not a quirk.
 - A histogram costs more than a counter. At the 2000 tag sets limit, measured with
   `BenchmarkRecordHistogramCardinality` and `BenchmarkRecordCardinality`, a histogram holds
   about 3.9 KB of heap per tag set (about 7.7 MB per name, and 18 lines per tag set on
