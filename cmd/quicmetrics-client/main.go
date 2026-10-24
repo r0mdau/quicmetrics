@@ -1,4 +1,4 @@
-// Command quicmetrics-client generates realistic DogStatsD counters, sends them to a
+// Command quicmetrics-client generates realistic DogStatsD counters and gauges, sends them to a
 // quicmetrics server and waits for each one to be acknowledged.
 package main
 
