@@ -7,7 +7,7 @@
 | Path | Role |
 | --- | --- |
 | `cmd/quicmetrics` | Server command: flags, wiring, `run(ctx, args, stderr) error` |
-| `cmd/quicmetrics-client` | Client that generates realistic counters (`generator.go`) |
+| `cmd/quicmetrics-client` | Client that generates realistic counters and gauges (`generator.go`) |
 | `internal/server` | `Server` (QUIC sessions), `Aggregator` (counters and gauges) + `Parse`, `SelfSignedTLSConfig` |
 | `internal/protocol` | `ALPN` and `DefaultAddr`, shared by both commands |
 
@@ -19,7 +19,7 @@ make bench                          # benchmarks, not part of check; compare run
 make vuln                           # govulncheck
 make compose-up / compose-down      # server + Prometheus in Docker
 go run ./cmd/quicmetrics            # QUIC on localhost:4242/udp, metrics on :2223
-go run ./cmd/quicmetrics-client     # generate counters for 10s (see -h for flags)
+go run ./cmd/quicmetrics-client     # generate counters and gauges for 10s (see -h for flags)
 ```
 
 ## Dependencies

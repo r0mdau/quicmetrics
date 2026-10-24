@@ -115,7 +115,15 @@ func TestGeneratorMetricsAreRecordedAndExposedWithoutErrors(t *testing.T) {
 			}
 		}
 	}
-	for _, want := range []string{"faas_invocations_total", "http_requests_total", "faas_billed_ms_total", "faas_errors_total"} {
+	for _, bad := range []string{"faas_concurrency_total", "faas_memory_utilization_total"} {
+		if names[bad] {
+			t.Errorf("gauge exposed as %s, want no _total suffix", bad)
+		}
+	}
+	for _, want := range []string{
+		"faas_invocations_total", "http_requests_total", "faas_billed_ms_total", "faas_errors_total",
+		"faas_concurrency", "faas_memory_utilization",
+	} {
 		if !names[want] {
 			t.Errorf("missing series %s", want)
 		}
