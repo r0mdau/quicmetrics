@@ -60,10 +60,11 @@ go run ./cmd/quicmetrics-client     # generate all metric types for 10s (see -h 
   bound's bucket (`le="5"` holds 5). There are no per-metric buckets. The value must be finite
   with a magnitude of at most 2^63 like for counters, which keeps `NaN`, `±Inf` and absurd
   single values out of the accumulating `_sum` (it does not bound the running total, see the
-  known quirks): `NaN`, `±Inf` and larger values are logged and dropped. A negative `|h` is accepted (it lands in `le="0"`
-  and lowers `_sum`); the parser already rejects a negative `|ms`. The sample rate is validated
-  like for counters (outside (0, 1] is dropped) but not applied. Names, tag keys, UTF-8 and the
-  cardinality limit follow the same rules and code paths as counters and gauges.
+  known quirks): `NaN`, `±Inf` and larger values are logged and dropped. A negative `|h` is
+  accepted (it lands in `le="0"` and lowers `_sum`); the parser already rejects a negative
+  `|ms`. The sample rate is validated like for counters (outside (0, 1] is dropped) but not
+  applied. Names, tag keys, UTF-8 and the cardinality limit follow the same rules and code
+  paths as counters and gauges.
 - Counter values are recorded as float64 (`1.5` stays `1.5`). `NaN` and values above 2^63
   in magnitude (including `±Inf`) are logged and dropped: the SDK sums them unchecked, and a
   `NaN` or `Inf` sum would stick to the series forever. The bound applies to each value, not to
@@ -82,8 +83,8 @@ go run ./cmd/quicmetrics-client     # generate all metric types for 10s (see -h 
   would answer HTTP 500, so keep `ContinueOnError`.
   `TestCounterAndGaugeWithTheSameNameKeepScrapesWorking` pins this.
   A histogram `foo` exposes the family `foo` with the series `foo_bucket`, `foo_sum` and
-  `foo_count`, so it coexists with a counter `foo` (`foo_total`) but collides with a gauge `foo`
-  (same family) and with a gauge `foo.count` or `foo.sum` (`foo_count`, `foo_sum`). Same
+  `foo_count`, so it coexists with a counter `foo` (`foo_total`) but collides with a gauge
+  `foo` (same family) and with a gauge `foo.count` or `foo.sum` (`foo_count`, `foo_sum`). Same
   outcome as above: one side disappears from `/metrics` depending on the order, the exporter
   logs `instrument type conflict` or the gatherer an error, and `ContinueOnError` keeps the
   scrape at HTTP 200. `TestHistogramCollisionsKeepScrapesWorking` pins this.
