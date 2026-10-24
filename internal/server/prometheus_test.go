@@ -29,7 +29,12 @@ func newPrometheusAggregator(t testing.TB) (*Aggregator, *prometheus.Registry) {
 
 func scrape(t testing.TB, registry *prometheus.Registry) string {
 	t.Helper()
-	srv := httptest.NewServer(promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	return scrapeWith(t, registry, promhttp.HandlerOpts{})
+}
+
+func scrapeWith(t testing.TB, registry *prometheus.Registry, opts promhttp.HandlerOpts) string {
+	t.Helper()
+	srv := httptest.NewServer(promhttp.HandlerFor(registry, opts))
 	defer srv.Close()
 	resp, err := http.Get(srv.URL)
 	if err != nil {
@@ -91,6 +96,90 @@ func TestPrometheusExpositionKeepsOneNamePerCounter(t *testing.T) {
 	if strings.Contains(body, "otel_scope_") {
 		t.Errorf("/metrics has scope labels:\n%s", body)
 	}
+}
+
+func TestPrometheusGaugeExposition(t *testing.T) {
+	t.Parallel()
+	agg, registry := newPrometheusAggregator(t)
+	for _, msg := range []string{
+		"temperature:20|g|#room:a",
+		"temperature:21.5|g|#room:a",
+		"temperature:-3|g|#room:b",
+		"temperature:19|g|@0.5|#room:c",
+	} {
+		agg.Record(context.Background(), msg)
+	}
+
+	body := scrape(t, registry)
+	assertContains(t, body,
+		"# HELP temperature a simple gauge",
+		"# TYPE temperature gauge",
+		`temperature{room="a"} 21.5`,
+		`temperature{room="b"} -3`,
+		`temperature{room="c"} 19`,
+	)
+	if strings.Contains(body, "temperature_total") {
+		t.Errorf("/metrics has a _total suffix on a gauge:\n%s", body)
+	}
+}
+
+// TestCounterAndGaugeWithTheSameNameKeepScrapesWorking pins what the exporter does when a
+// counter and a gauge want the same Prometheus name. The names foo (gauge) and foo_total
+// (counter) are different families and coexist. foo.total as a gauge collides with the foo
+// counter: only the first instrument created is exposed, the exporter logs the conflict, and
+// promhttp ContinueOnError, as configured in cmd/quicmetrics, keeps the rest of the scrape
+// working.
+// Without ContinueOnError the collision is an HTTP 500, like the foo and foo.total counters.
+func TestCounterAndGaugeWithTheSameNameKeepScrapesWorking(t *testing.T) {
+	t.Parallel()
+	continueOnError := promhttp.HandlerOpts{ErrorHandling: promhttp.ContinueOnError}
+
+	t.Run("same name coexists", func(t *testing.T) {
+		t.Parallel()
+		agg, registry := newPrometheusAggregator(t)
+		for _, msg := range []string{"foo:1|c", "foo:2|g", "foo:3|c", "foo:4|g"} {
+			agg.Record(context.Background(), msg)
+		}
+		assertContains(t, scrape(t, registry),
+			"# TYPE foo gauge", "foo 4",
+			"# TYPE foo_total counter", "foo_total 4",
+		)
+	})
+
+	for _, order := range [][]string{{"foo:1|c", "foo.total:2|g"}, {"foo.total:2|g", "foo:1|c"}} {
+		t.Run(strings.Join(order, " then "), func(t *testing.T) {
+			t.Parallel()
+			agg, registry := newPrometheusAggregator(t)
+			for _, msg := range order {
+				agg.Record(context.Background(), msg)
+			}
+			agg.Record(context.Background(), "ok:1|c")
+
+			body := scrapeWith(t, registry, continueOnError)
+			assertContains(t, body, "ok_total 1")
+			if n := strings.Count(body, "# TYPE foo_total "); n != 1 {
+				t.Errorf("/metrics has %d foo_total families, want 1:\n%s", n, body)
+			}
+		})
+	}
+
+	t.Run("collision is an error without ContinueOnError", func(t *testing.T) {
+		t.Parallel()
+		agg, registry := newPrometheusAggregator(t)
+		agg.Record(context.Background(), "foo:1|c")
+		agg.Record(context.Background(), "foo.total:2|g")
+
+		srv := httptest.NewServer(promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+		defer srv.Close()
+		resp, err := http.Get(srv.URL)
+		if err != nil {
+			t.Fatalf("GET /metrics: %v", err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusInternalServerError)
+		}
+	})
 }
 
 func TestInvalidUTF8IsNotRecordedAndScrapeSurvives(t *testing.T) {

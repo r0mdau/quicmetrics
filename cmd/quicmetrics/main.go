@@ -1,5 +1,5 @@
-// Command quicmetrics receives DogStatsD counters over raw QUIC and exposes them on a
-// Prometheus /metrics endpoint.
+// Command quicmetrics receives DogStatsD counters and gauges over raw QUIC and exposes them
+// on a Prometheus /metrics endpoint.
 package main
 
 import (

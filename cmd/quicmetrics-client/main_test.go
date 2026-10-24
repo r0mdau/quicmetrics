@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +19,7 @@ import (
 	"github.com/r0mdau/quicmetrics/internal/server"
 )
 
-func TestSendMetricsDeliversGeneratedCounters(t *testing.T) {
+func TestSendMetricsDeliversGeneratedMetrics(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -39,9 +40,14 @@ func TestSendMetricsDeliversGeneratedCounters(t *testing.T) {
 	for range count {
 		wantAgg.Record(ctx, gen.next())
 	}
-	got, want := collectSums(t, reader), collectSums(t, wantReader)
+	got, want := collectValues(t, reader), collectValues(t, wantReader)
 	if !maps.Equal(got, want) {
 		t.Fatalf("got %v\nwant %v", got, want)
+	}
+	for _, name := range []string{"faas.concurrency", "faas.memory.utilization"} {
+		if !slices.ContainsFunc(slices.Collect(maps.Keys(got)), func(series string) bool { return strings.HasPrefix(series, name+"{") }) {
+			t.Errorf("server recorded no %s series", name)
+		}
 	}
 }
 
@@ -174,23 +180,28 @@ func startServer(ctx context.Context, t *testing.T) (addr string, reader *sdkmet
 	return listener.Addr().String(), reader
 }
 
-func collectSums(t *testing.T, reader *sdkmetric.ManualReader) map[string]float64 {
+func collectValues(t *testing.T, reader *sdkmetric.ManualReader) map[string]float64 {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
 	if err := reader.Collect(context.Background(), &rm); err != nil {
 		t.Fatalf("collect: %v", err)
 	}
-	sums := map[string]float64{}
+	values := map[string]float64{}
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
-			sum, ok := m.Data.(metricdata.Sum[float64])
-			if !ok {
+			var points []metricdata.DataPoint[float64]
+			switch data := m.Data.(type) {
+			case metricdata.Sum[float64]:
+				points = data.DataPoints
+			case metricdata.Gauge[float64]:
+				points = data.DataPoints
+			default:
 				t.Fatalf("metric %q: unexpected aggregation %T", m.Name, m.Data)
 			}
-			for _, dp := range sum.DataPoints {
-				sums[m.Name+"{"+dp.Attributes.Encoded(attribute.DefaultEncoder())+"}"] = dp.Value
+			for _, dp := range points {
+				values[m.Name+"{"+dp.Attributes.Encoded(attribute.DefaultEncoder())+"}"] = dp.Value
 			}
 		}
 	}
-	return sums
+	return values
 }

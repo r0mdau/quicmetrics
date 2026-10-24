@@ -29,30 +29,53 @@ func newTestAggregator() (*Aggregator, sdkmetric.Reader) {
 	return newAggregator(reader), reader
 }
 
-func collectSums(t testing.TB, reader sdkmetric.Reader) map[string]metricdata.Sum[float64] {
+// collect returns the sums and gauges recorded so far, keyed by name and attributes. It fails
+// on any other aggregation, so a metric that ends up with an unexpected kind is not skipped.
+func collect(t testing.TB, reader sdkmetric.Reader) (map[string]metricdata.Sum[float64], map[string]float64) {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
 	if err := reader.Collect(context.Background(), &rm); err != nil {
 		t.Fatalf("collect: %v", err)
 	}
 	sums := map[string]metricdata.Sum[float64]{}
+	gauges := map[string]float64{}
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
-			sum, ok := m.Data.(metricdata.Sum[float64])
-			if !ok {
-				t.Fatalf("metric %q: unexpected aggregation %T", m.Name, m.Data)
-			}
-			for _, dp := range sum.DataPoints {
-				key := m.Name + "{" + dp.Attributes.Encoded(attribute.DefaultEncoder()) + "}"
-				sums[key] = metricdata.Sum[float64]{
-					DataPoints:  []metricdata.DataPoint[float64]{dp},
-					Temporality: sum.Temporality,
-					IsMonotonic: sum.IsMonotonic,
+			switch data := m.Data.(type) {
+			case metricdata.Sum[float64]:
+				for _, dp := range data.DataPoints {
+					sums[seriesKey(m.Name, dp.Attributes)] = metricdata.Sum[float64]{
+						DataPoints:  []metricdata.DataPoint[float64]{dp},
+						Temporality: data.Temporality,
+						IsMonotonic: data.IsMonotonic,
+					}
 				}
+			case metricdata.Gauge[float64]:
+				for _, dp := range data.DataPoints {
+					gauges[seriesKey(m.Name, dp.Attributes)] = dp.Value
+				}
+			default:
+				t.Fatalf("metric %q: unexpected aggregation %T", m.Name, m.Data)
 			}
 		}
 	}
+	return sums, gauges
+}
+
+func seriesKey(name string, attrs attribute.Set) string {
+	return name + "{" + attrs.Encoded(attribute.DefaultEncoder()) + "}"
+}
+
+func collectSums(t testing.TB, reader sdkmetric.Reader) map[string]metricdata.Sum[float64] {
+	t.Helper()
+	sums, _ := collect(t, reader)
 	return sums
+}
+
+func collectGauges(t testing.TB, reader sdkmetric.Reader) map[string]float64 {
+	t.Helper()
+	_, gauges := collect(t, reader)
+	return gauges
 }
 
 func values(sums map[string]metricdata.Sum[float64]) map[string]float64 {
@@ -84,6 +107,27 @@ func TestParse(t *testing.T) {
 	}{
 		{name: "counter", raw: "foo:1|c|#a:b"},
 		{name: "gauge", raw: "temperature:21.5|g"},
+		{name: "gauge with tags", raw: "temperature:21.5|g|#room:a"},
+		{name: "negative gauge", raw: "temperature:-3|g"},
+		{name: "huge gauge", raw: "temperature:1e300|g"},
+		{name: "gauge above 2^63", raw: "temperature:1e19|g"},
+		{name: "NaN gauge", raw: "temperature:NaN|g", wantErr: true},
+		{name: "infinite gauge", raw: "temperature:+Inf|g", wantErr: true},
+		{name: "negative infinite gauge", raw: "temperature:-Inf|g", wantErr: true},
+		{name: "overflowing gauge", raw: "temperature:1e999|g", wantErr: true},
+		{name: "empty gauge segment panics in the parser", raw: "temperature:1|g|", wantErr: true},
+		{name: "invalid UTF-8 gauge", raw: "temperature\xff:1|g", wantErr: true},
+		{name: "sampled gauge", raw: "temperature:21.5|g|@0.1|#room:a"},
+		{name: "gauge sample rate 1", raw: "temperature:21.5|g|@1"},
+		{name: "gauge sample rate 0", raw: "temperature:21.5|g|@0", wantErr: true},
+		{name: "gauge NaN sample rate", raw: "temperature:21.5|g|@NaN", wantErr: true},
+		{name: "gauge sample rate above 1", raw: "temperature:21.5|g|@1.5", wantErr: true},
+		{name: "gauge negative sample rate", raw: "temperature:21.5|g|@-0.5", wantErr: true},
+		{name: "gauge sample rate not a number", raw: "temperature:21.5|g|@abc", wantErr: true},
+		{name: "gauge sample rate after tags", raw: "temperature:21.5|g|#a:b|@0", wantErr: true},
+		{name: "gauge later sample rate 0 after a valid one", raw: "temperature:21.5|g|@0.5|@0", wantErr: true},
+		{name: "gauge sample rate underflowing float32 is judged as float64", raw: "temperature:21.5|g|@1e-50"},
+		{name: "gauge smallest sample rate is valid since nothing is scaled", raw: "temperature:21.5|g|@5e-324"},
 		{name: "empty trailing segment panics in the parser", raw: "foo:1|c|", wantErr: true},
 		{name: "empty middle segment panics in the parser", raw: "foo:1|c||#a:b", wantErr: true},
 		{name: "invalid UTF-8 name", raw: "foo\xff:1|c", wantErr: true},
@@ -173,6 +217,41 @@ func TestParseCounterValue(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Errorf("Parse(%q) value = %v, want %v", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseGaugeValue(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		raw  string
+		want float64
+	}{
+		{raw: "temperature:21.5|g", want: 21.5},
+		{raw: "temperature:3|g", want: 3},
+		{raw: "temperature:+3|g", want: 3},
+		{raw: "temperature:-3|g", want: -3},
+		{raw: "temperature:0|g", want: 0},
+		{raw: "temperature:1e-3|g", want: 0.001},
+		{raw: "temperature:1e300|g", want: 1e300},
+		{raw: "temperature:21.5|g|@0.1", want: 21.5},
+		{raw: "temperature:21.5|g|@0.5|#a:b", want: 21.5},
+		{raw: "temperature:21.5|g|#a:b|@0.25", want: 21.5},
+		{raw: "temperature:21.5|g|@5e-324", want: 21.5},
+	}
+	for _, tt := range tests {
+		t.Run(tt.raw, func(t *testing.T) {
+			t.Parallel()
+			m, err := Parse(tt.raw)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tt.raw, err)
+			}
+			if m.Type != dogstatsd.Gauge {
+				t.Errorf("Parse(%q) type = %q, want a gauge", tt.raw, m.Type)
+			}
+			if got, ok := m.Value.(float64); !ok || got != tt.want {
+				t.Errorf("Parse(%q) value = %v (%T), want float64 %v", tt.raw, m.Value, m.Value, tt.want)
 			}
 		})
 	}
@@ -278,10 +357,160 @@ func TestCounterIsMonotonicAndCumulative(t *testing.T) {
 	}
 }
 
+func TestGaugeAggregation(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		messages []string
+		want     map[string]float64
+	}{
+		{
+			name:     "single gauge without tags",
+			messages: []string{"temperature:21.5|g"},
+			want:     map[string]float64{"temperature{}": 21.5},
+		},
+		{
+			name:     "tags become attributes",
+			messages: []string{"temperature:21.5|g|#room:a,floor:2"},
+			want:     map[string]float64{"temperature{floor=2,room=a}": 21.5},
+		},
+		{
+			name:     "last value wins per series",
+			messages: []string{"temperature:20|g|#room:a", "temperature:25|g|#room:a", "temperature:18|g|#room:a"},
+			want:     map[string]float64{"temperature{room=a}": 18},
+		},
+		{
+			name:     "tag sets are separate series",
+			messages: []string{"temperature:20|g|#room:a", "temperature:25|g|#room:b", "temperature:30|g", "temperature:21|g|#room:a"},
+			want: map[string]float64{
+				"temperature{room=a}": 21,
+				"temperature{room=b}": 25,
+				"temperature{}":       30,
+			},
+		},
+		{
+			name:     "different names are separate metrics",
+			messages: []string{"temperature:20|g", "humidity:55|g"},
+			want:     map[string]float64{"temperature{}": 20, "humidity{}": 55},
+		},
+		{
+			name:     "fractional values are kept",
+			messages: []string{"temperature:0.25|g", "load:1e-3|g"},
+			want:     map[string]float64{"temperature{}": 0.25, "load{}": 0.001},
+		},
+		{
+			name:     "negative values are kept",
+			messages: []string{"temperature:5|g", "temperature:-12.5|g"},
+			want:     map[string]float64{"temperature{}": -12.5},
+		},
+		{
+			name:     "zero overwrites",
+			messages: []string{"temperature:5|g", "temperature:0|g"},
+			want:     map[string]float64{"temperature{}": 0},
+		},
+		{
+			name:     "a leading sign is an absolute value, not a delta",
+			messages: []string{"temperature:10|g", "temperature:+3|g"},
+			want:     map[string]float64{"temperature{}": 3},
+		},
+		{
+			name:     "a negative sign is an absolute value, not a delta",
+			messages: []string{"temperature:10|g", "temperature:-3|g"},
+			want:     map[string]float64{"temperature{}": -3},
+		},
+		{
+			name:     "values above 2^63 are fine since nothing is summed",
+			messages: []string{"temperature:1e300|g"},
+			want:     map[string]float64{"temperature{}": 1e300},
+		},
+		{
+			name:     "sample rate is ignored",
+			messages: []string{"temperature:21.5|g|@0.1", "load:3|g|@0.5|#a:x"},
+			want:     map[string]float64{"temperature{}": 21.5, "load{a=x}": 3},
+		},
+		{
+			name:     "sampled and unsampled gauges share a series",
+			messages: []string{"temperature:20|g|@0.1", "temperature:22|g", "temperature:24|g|@1"},
+			want:     map[string]float64{"temperature{}": 24},
+		},
+		{
+			name:     "invalid gauges leave the series alone",
+			messages: []string{"temperature:20|g", "temperature:NaN|g", "temperature:+Inf|g", "temperature:1|g|@0", "temperature:1|g|#__x:y"},
+			want:     map[string]float64{"temperature{}": 20},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			agg, reader := newTestAggregator()
+			for _, msg := range tt.messages {
+				agg.Record(context.Background(), msg)
+			}
+			assertValues(t, collectGauges(t, reader), tt.want)
+			if sums := collectSums(t, reader); len(sums) != 0 {
+				t.Errorf("recorded sums %v, want none", values(sums))
+			}
+		})
+	}
+}
+
+func TestCountersAndGaugesAreSeparateInstruments(t *testing.T) {
+	t.Parallel()
+	agg, reader := newTestAggregator()
+	for _, msg := range []string{"requests:5|c", "temperature:21.5|g", "requests:2|c", "temperature:19|g"} {
+		agg.Record(context.Background(), msg)
+	}
+
+	assertValues(t, values(collectSums(t, reader)), map[string]float64{"requests{}": 7})
+	assertValues(t, collectGauges(t, reader), map[string]float64{"temperature{}": 19})
+}
+
+func TestInvalidGaugeRecordsNothing(t *testing.T) {
+	t.Parallel()
+	for _, msg := range []string{
+		"temperature:NaN|g",
+		"temperature:Inf|g",
+		"temperature:+Inf|g",
+		"temperature:-Inf|g",
+		"temperature:1e999|g",
+		"temperature:abc|g",
+		"temperature:|g",
+		"temperature:21.5|g|",
+		"temperature:21.5|g||#a:b",
+		"temperature:21.5|g|@0",
+		"temperature:21.5|g|@-0",
+		"temperature:21.5|g|@NaN",
+		"temperature:21.5|g|@-0.5",
+		"temperature:21.5|g|@1.5",
+		"temperature:21.5|g|@abc",
+		"temperature:21.5|g|@",
+		"temperature:21.5|g|#a:b|@0",
+		"temperature:21.5|g|#_:v",
+		"temperature:21.5|g|#__name__:x",
+		"temperature:21.5|g|#ok:v,__x:y",
+		"temperature:21.5|g|#é:v",
+		"temperature\xff:21.5|g",
+		"temperature:21.5|g|#k:v\xff",
+		"9lives:21.5|g",
+		"foo@bar:21.5|g",
+		"-foo:21.5|g",
+	} {
+		t.Run(msg, func(t *testing.T) {
+			t.Parallel()
+			agg, reader := newTestAggregator()
+			agg.Record(context.Background(), msg)
+			sums, gauges := collect(t, reader)
+			if len(sums) != 0 || len(gauges) != 0 {
+				t.Errorf("recorded %v and %v, want nothing", values(sums), gauges)
+			}
+		})
+	}
+}
+
 func TestIgnoredInputRecordsNothing(t *testing.T) {
 	t.Parallel()
 	for _, msg := range []string{
-		"temperature:21.5|g",
+		"temperature:21.5|h",
 		"latency:12|h",
 		"request.time:320|ms",
 		"users.unique:alice|s",
@@ -303,15 +532,16 @@ func TestIgnoredInputRecordsNothing(t *testing.T) {
 		"foo:1|c|@abc",
 		"foo:1|c|@1e-50",
 		"foo:1e18|c|@0.01",
-		"temperature:21.5|g|@0",
+		"temperature:21.5|h|@0",
 		"",
 	} {
 		t.Run(msg, func(t *testing.T) {
 			t.Parallel()
 			agg, reader := newTestAggregator()
 			agg.Record(context.Background(), msg)
-			if got := collectSums(t, reader); len(got) != 0 {
-				t.Errorf("recorded %v, want nothing", values(got))
+			sums, gauges := collect(t, reader)
+			if len(sums) != 0 || len(gauges) != 0 {
+				t.Errorf("recorded %v and %v, want nothing", values(sums), gauges)
 			}
 		})
 	}
@@ -330,6 +560,18 @@ func TestRecordCounterValueTypes(t *testing.T) {
 		"ints{}":   2,
 		"floats{}": 1.5,
 	})
+}
+
+func TestRecordGaugeValueTypes(t *testing.T) {
+	t.Parallel()
+	agg, reader := newTestAggregator()
+	ctx := context.Background()
+	agg.recordGauge(ctx, &dogstatsd.Metric{Type: dogstatsd.Gauge, Name: "floats", Value: 1.5})
+	agg.recordGauge(ctx, &dogstatsd.Metric{Type: dogstatsd.Gauge, Name: "ints", Value: int64(2)})
+	agg.recordGauge(ctx, &dogstatsd.Metric{Type: dogstatsd.Gauge, Name: "strings", Value: "x"})
+	agg.recordGauge(ctx, &dogstatsd.Metric{Type: dogstatsd.Gauge, Name: "nils"})
+
+	assertValues(t, collectGauges(t, reader), map[string]float64{"floats{}": 1.5})
 }
 
 // benchLines returns count valid counters of value 1 shaped like the client generator, spread
@@ -381,6 +623,10 @@ func taggedLine(tags int) string {
 	return sb.String()
 }
 
+func gaugeLine(tags int) string {
+	return strings.Replace(taggedLine(tags), "bench.requests:1|c", "bench.temperature:21.5|g", 1)
+}
+
 func sumValues(values map[string]float64) float64 {
 	var sum float64
 	for _, v := range values {
@@ -396,6 +642,7 @@ func BenchmarkParse(b *testing.B) {
 		wantErr bool
 	}{
 		{name: "counter_4_tags", raw: taggedLine(4)},
+		{name: "gauge_4_tags", raw: gaugeLine(4)},
 		{name: "empty_segment", raw: "foo:1|c|", wantErr: true},
 		{name: "invalid_utf8", raw: "foo\xff:1|c", wantErr: true},
 		{name: "garbage", raw: "garbage", wantErr: true},
@@ -419,13 +666,15 @@ func BenchmarkRecord(b *testing.B) {
 		raw        string
 		logger     *slog.Logger
 		wantSeries int
+		gauge      bool
 	}{
-		{"tags_0", taggedLine(0), discardLogger, 1},
-		{"tags_4", taggedLine(4), discardLogger, 1},
-		{"tags_8", taggedLine(8), discardLogger, 1},
-		{"tags_4_info_logger", taggedLine(4), infoLogger, 1},
-		{"gauge_dropped", "bench.temperature:21.5|g", infoLogger, 0},
-		{"invalid_warned", "foo:1|c|", infoLogger, 0},
+		{"tags_0", taggedLine(0), discardLogger, 1, false},
+		{"tags_4", taggedLine(4), discardLogger, 1, false},
+		{"tags_8", taggedLine(8), discardLogger, 1, false},
+		{"tags_4_info_logger", taggedLine(4), infoLogger, 1, false},
+		{"gauge_tags_4", gaugeLine(4), discardLogger, 1, true},
+		{"histogram_dropped", "bench.latency:12|h", infoLogger, 0, false},
+		{"invalid_warned", "foo:1|c|", infoLogger, 0, false},
 	}
 	ctx := context.Background()
 	for _, tt := range tests {
@@ -438,9 +687,16 @@ func BenchmarkRecord(b *testing.B) {
 				agg.Record(ctx, tt.raw)
 				recorded++
 			}
-			got := values(collectSums(b, reader))
-			if len(got) != tt.wantSeries {
-				b.Fatalf("got series %v, want %d", got, tt.wantSeries)
+			sums, gauges := collect(b, reader)
+			got := values(sums)
+			if tt.gauge {
+				if len(sums) != 0 || len(gauges) != tt.wantSeries || sumValues(gauges) != 21.5*float64(tt.wantSeries) {
+					b.Fatalf("got sums %v and gauges %v, want %d gauge series of 21.5", got, gauges, tt.wantSeries)
+				}
+				return
+			}
+			if len(got) != tt.wantSeries || len(gauges) != 0 {
+				b.Fatalf("got series %v and gauges %v, want %d sums", got, gauges, tt.wantSeries)
 			}
 			if tt.wantSeries > 0 && sumValues(got) != float64(recorded) {
 				b.Fatalf("recorded total = %v, want %d", sumValues(got), recorded)
@@ -484,7 +740,9 @@ func TestRecordAllocations(t *testing.T) {
 		{"float_counter_4_tags", strings.Replace(taggedLine(4), ":1|", ":1.5|", 1), 15},
 		// Parse boxes the scaled float64 just like a fractional value.
 		{"sampled_counter_4_tags", strings.Replace(taggedLine(4), ":1|c", ":1|c|@0.1", 1), 15},
-		{"gauge_dropped", "bench.temperature:21.5|g", 7},
+		// The parser already boxes the float64, so a gauge costs as much as an integer counter.
+		{"gauge_4_tags", gaugeLine(4), 14},
+		{"histogram_dropped", "bench.latency:12|h", 7},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

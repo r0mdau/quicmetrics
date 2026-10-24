@@ -7,7 +7,8 @@ This proof of concept uses:
 - statsd string format for metrics
 
 The `quicmetrics-client` generates realistic FaaS traffic (invocations, HTTP requests,
-billed time, errors), so you can watch the counters add up in the Prometheus endpoint output.
+billed time, errors, in-flight executions, memory use), so you can watch the counters add up
+and the gauges move in the Prometheus endpoint output.
 
 Libraries used:
 - [quic-go](https://github.com/quic-go/quic-go), a QUIC implementation in pure go
@@ -20,7 +21,7 @@ Libraries used:
 | Path | Role |
 | --- | --- |
 | `cmd/quicmetrics` | Server command: flags, wiring, graceful shutdown |
-| `cmd/quicmetrics-client` | Client that generates realistic counters |
+| `cmd/quicmetrics-client` | Client that generates realistic counters and gauges |
 | `internal/server` | QUIC sessions, DogStatsD parsing, OpenTelemetry aggregation, TLS |
 | `internal/protocol` | ALPN and default address shared by server and client |
 
@@ -63,13 +64,22 @@ Client flags:
 The client sends four counters, tagged by `function` and `region`: `faas.invocations`
 (with `cold_start`), `http.requests` (with `method` and `status`), `faas.billed.ms` and
 `faas.errors` (with `error`). A few functions get most of the traffic, most requests succeed,
-and errors stay rare. With all 10 functions, `http.requests` has at most 600 tag sets, well
-under the server's limit of 2000 per counter.
+and errors stay rare. It also sends two gauges on about 15% of the lines, tagged by `function`
+and `region`: `faas.concurrency`, the in-flight executions (a whole number that drifts by at
+most one between samples of a series) and `faas.memory.utilization`, a ratio from 0 to 1.
+With all 10 functions, `http.requests` has at most 600 tag sets, well under the server's limit
+of 2000 per counter or gauge.
+
+A counter adds up, so Prometheus exposes it with a `_total` suffix. A gauge (`|g`) keeps only
+the last value received for each series and is exposed as is, without `_total`. A gauge value
+can be any finite number, and a leading sign is an absolute value, not a delta. A sample rate
+(`|@0.5`) is validated like for counters but never scales a gauge. A gauge keeps its last value on `/metrics` after the client stops
+sending it.
 
 ### Client examples
 
 Send 400 metrics at 200 per second across 4 functions. With a fixed seed, a fresh server
-always ends up with the same 82 series:
+always ends up with the same 92 counter series (and 17 gauge series):
 
     $ go run ./cmd/quicmetrics-client -rate 200 -count 400 -functions 4 -seed 7
     level=INFO msg="generating metrics" addr=localhost:4242 seed=7 rate=200 count=400 duration=10s functions=4
@@ -77,10 +87,10 @@ always ends up with the same 82 series:
 
     $ curl -s localhost:2223/metrics | grep -E '^(faas|http)'
     ...
-    faas_billed_ms_total{function="checkout",region="eu-west-1"} 1434
-    faas_errors_total{error="timeout",function="checkout",region="us-east-1"} 4
-    faas_invocations_total{cold_start="false",function="checkout",region="us-east-1"} 123
-    http_requests_total{function="checkout",method="GET",region="us-east-1",status="200"} 159
+    faas_billed_ms_total{function="checkout",region="eu-west-1"} 366
+    faas_errors_total{error="timeout",function="checkout",region="us-east-1"} 1
+    faas_invocations_total{cold_start="false",function="checkout",region="us-east-1"} 95
+    http_requests_total{function="checkout",method="GET",region="us-east-1",status="200"} 115
     ...
 
 Other runs:

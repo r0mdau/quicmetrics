@@ -31,12 +31,17 @@ var (
 	}
 )
 
-// generator produces a stream of DogStatsD counters that looks like the traffic of a small
+// maxConcurrency caps the simulated in-flight executions of one function in one region.
+const maxConcurrency = 100
+
+// generator produces a stream of DogStatsD metrics that looks like the traffic of a small
 // FaaS platform: a few popular functions, a long tail, mostly successful requests and a
-// trickle of errors. All randomness comes from one seed so a run can be replayed.
+// trickle of errors, as counters, plus gauges for in-flight executions and memory use.
+// All randomness comes from one seed so a run can be replayed.
 type generator struct {
-	rng       *rand.Rand
-	functions []weighted
+	rng         *rand.Rand
+	functions   []weighted
+	concurrency map[string]int
 }
 
 // newGenerator simulates the first functions of functionNames, which run must have checked
@@ -47,30 +52,49 @@ func newGenerator(seed uint64, functions int) *generator {
 		fns[i] = weighted{name, 100 / (i + 1)}
 	}
 	return &generator{
-		rng:       rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15)), //nolint:gosec // simulated traffic, not security sensitive
-		functions: fns,
+		rng:         rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15)), //nolint:gosec // simulated traffic, not security sensitive
+		functions:   fns,
+		concurrency: map[string]int{},
 	}
 }
 
-// next returns one DogStatsD counter line.
+// next returns one DogStatsD counter or gauge line.
 func (g *generator) next() string {
 	fn := g.pick(g.functions)
 	region := g.pick(regions)
 	switch roll := g.rng.IntN(100); {
-	case roll < 45:
+	case roll < 38:
 		cold := g.rng.IntN(100) < 5
 		return fmt.Sprintf("faas.invocations:%d|c|#function:%s,region:%s,cold_start:%t",
 			1+g.rng.IntN(5), fn, region, cold)
-	case roll < 85:
+	case roll < 72:
 		return fmt.Sprintf("http.requests:%d|c|#function:%s,region:%s,method:%s,status:%s",
 			1+g.rng.IntN(10), fn, region, g.pick(methods), g.pick(statuses))
-	case roll < 97:
+	case roll < 82:
 		return fmt.Sprintf("faas.billed.ms:%d|c|#function:%s,region:%s",
 			10+int(g.rng.ExpFloat64()*120), fn, region)
-	default:
+	case roll < 85:
 		return fmt.Sprintf("faas.errors:1|c|#function:%s,region:%s,error:%s",
 			fn, region, g.pick(errorKinds))
+	case roll < 93:
+		return fmt.Sprintf("faas.concurrency:%d|g|#function:%s,region:%s",
+			g.drift(fn+"/"+region), fn, region)
+	default:
+		return fmt.Sprintf("faas.memory.utilization:%.3f|g|#function:%s,region:%s",
+			min(max(0.5+0.15*g.rng.NormFloat64(), 0), 1), fn, region)
 	}
+}
+
+// drift moves the in-flight executions of a series by at most one, so the gauge wanders
+// instead of jumping around.
+func (g *generator) drift(series string) int {
+	n, ok := g.concurrency[series]
+	if !ok {
+		n = 1 + g.rng.IntN(10)
+	}
+	n = min(max(n+g.rng.IntN(3)-1, 0), maxConcurrency)
+	g.concurrency[series] = n
+	return n
 }
 
 func (g *generator) pick(choices []weighted) string {

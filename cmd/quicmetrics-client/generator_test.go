@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"math"
 	"strings"
 	"testing"
 
@@ -31,6 +32,46 @@ func TestGeneratorIsDeterministicForASeed(t *testing.T) {
 	}
 }
 
+func TestGeneratorEmitsCountersAndGaugesInRange(t *testing.T) {
+	t.Parallel()
+	gen := newGenerator(5, len(functionNames))
+	seen := map[string]int{}
+	const lines = 10000
+	for range lines {
+		raw := gen.next()
+		m, err := server.Parse(raw)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", raw, err)
+		}
+		seen[m.Name]++
+		switch m.Name {
+		case "faas.concurrency":
+			v, ok := m.Value.(float64)
+			if m.Type != dogstatsd.Gauge || !ok || v != math.Trunc(v) || v < 0 || v > maxConcurrency {
+				t.Fatalf("%q: want a gauge with an integer value in [0, %d]", raw, maxConcurrency)
+			}
+		case "faas.memory.utilization":
+			v, ok := m.Value.(float64)
+			if m.Type != dogstatsd.Gauge || !ok || v < 0 || v > 1 {
+				t.Fatalf("%q: want a gauge with a value in [0, 1]", raw)
+			}
+		case "faas.invocations", "http.requests", "faas.billed.ms", "faas.errors":
+			if v, ok := m.Value.(int64); m.Type != dogstatsd.Counter || !ok || v <= 0 {
+				t.Fatalf("%q: want a counter with a positive integer value", raw)
+			}
+		default:
+			t.Fatalf("%q: unexpected metric %q", raw, m.Name)
+		}
+	}
+	if len(seen) != 6 {
+		t.Errorf("generated %v, want all four counters and both gauges", seen)
+	}
+	gauges := seen["faas.concurrency"] + seen["faas.memory.utilization"]
+	if gauges < lines*10/100 || gauges > lines*20/100 {
+		t.Errorf("%d of %d lines are gauges, want about 15%%", gauges, lines)
+	}
+}
+
 func TestGeneratorMetricsAreRecordedAndExposedWithoutErrors(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -50,11 +91,8 @@ func TestGeneratorMetricsAreRecordedAndExposedWithoutErrors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Parse(%q): %v", raw, err)
 		}
-		if m.Type != dogstatsd.Counter {
-			t.Fatalf("%q: type %q, want counter", raw, m.Type)
-		}
-		if v, ok := m.Value.(int64); !ok || v <= 0 {
-			t.Fatalf("%q: value %v, want a positive integer", raw, m.Value)
+		if m.Type != dogstatsd.Counter && m.Type != dogstatsd.Gauge {
+			t.Fatalf("%q: type %q, want counter or gauge", raw, m.Type)
 		}
 		agg.Record(ctx, raw)
 	}
@@ -77,7 +115,15 @@ func TestGeneratorMetricsAreRecordedAndExposedWithoutErrors(t *testing.T) {
 			}
 		}
 	}
-	for _, want := range []string{"faas_invocations_total", "http_requests_total", "faas_billed_ms_total", "faas_errors_total"} {
+	for _, bad := range []string{"faas_concurrency_total", "faas_memory_utilization_total"} {
+		if names[bad] {
+			t.Errorf("gauge exposed as %s, want no _total suffix", bad)
+		}
+	}
+	for _, want := range []string{
+		"faas_invocations_total", "http_requests_total", "faas_billed_ms_total", "faas_errors_total",
+		"faas_concurrency", "faas_memory_utilization",
+	} {
 		if !names[want] {
 			t.Errorf("missing series %s", want)
 		}
