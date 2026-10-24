@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -42,6 +43,11 @@ func TestSendMetricsDeliversGeneratedMetrics(t *testing.T) {
 	got, want := collectValues(t, reader), collectValues(t, wantReader)
 	if !maps.Equal(got, want) {
 		t.Fatalf("got %v\nwant %v", got, want)
+	}
+	for _, name := range []string{"faas.concurrency", "faas.memory.utilization"} {
+		if !slices.ContainsFunc(slices.Collect(maps.Keys(got)), func(series string) bool { return strings.HasPrefix(series, name+"{") }) {
+			t.Errorf("server recorded no %s series", name)
+		}
 	}
 }
 
