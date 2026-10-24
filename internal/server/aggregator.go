@@ -24,6 +24,10 @@ import (
 // The returned counter value is already divided by the sample rate, so foo:1|c|@0.1 yields
 // 10. The scaled value obeys the same bound, and a rate outside (0, 1] is an error. Rate keeps
 // the float32 the parser read and must not be applied again.
+//
+// Gauge values are returned as the parser read them, as float64. They must be finite, since
+// nothing is summed there is no other bound, and a sign (+3, -3) is part of the absolute value.
+// The sample rate must be in (0, 1] like for counters, but it is not applied to the value.
 func Parse(raw string) (*dogstatsd.Metric, error) {
 	if !utf8.ValidString(raw) {
 		return nil, errors.New("metric is not valid UTF-8")
@@ -32,7 +36,8 @@ func Parse(raw string) (*dogstatsd.Metric, error) {
 	if err != nil {
 		return nil, err
 	}
-	if m.Type == dogstatsd.Counter {
+	switch m.Type {
+	case dogstatsd.Counter:
 		v, err := counterValue(raw)
 		if err != nil {
 			return nil, err
@@ -40,6 +45,10 @@ func Parse(raw string) (*dogstatsd.Metric, error) {
 		// Keeping the parser's int64 when it is exact avoids boxing a second value.
 		if i, ok := m.Value.(int64); !ok || float64(i) != v {
 			m.Value = v
+		}
+	case dogstatsd.Gauge:
+		if err := checkGauge(m, raw); err != nil {
+			return nil, err
 		}
 	}
 	return m, nil
@@ -57,8 +66,7 @@ func parse(raw string) (m *dogstatsd.Metric, err error) {
 // counterValue parses the value of a counter line that dogstatsd.Parse already accepted and
 // scales it by its sample rate.
 func counterValue(raw string) (float64, error) {
-	_, rest, _ := strings.Cut(raw, ":")
-	s, tail, _ := strings.Cut(rest, "|")
+	s, tail := valueAndTail(raw)
 	v, err := strconv.ParseFloat(s, 64)
 	if err != nil {
 		return 0, fmt.Errorf("parse counter value: %w", err)
@@ -75,6 +83,25 @@ func counterValue(raw string) (float64, error) {
 		return 0, fmt.Errorf("counter value %q at sample rate %v is not a number of at most 2^63 in magnitude", s, rate)
 	}
 	return scaled, nil
+}
+
+// checkGauge validates a gauge that dogstatsd.Parse already accepted: its value must be finite
+// and its sample rate valid, although the rate is not applied.
+func checkGauge(m *dogstatsd.Metric, raw string) error {
+	if v, ok := m.Value.(float64); !ok || math.IsNaN(v) || math.IsInf(v, 0) {
+		return fmt.Errorf("gauge value %v is not a finite number", m.Value)
+	}
+	_, tail := valueAndTail(raw)
+	_, err := sampleRate(tail)
+	return err
+}
+
+// valueAndTail splits a line that dogstatsd.Parse already accepted into the raw value and
+// the segments that follow the value.
+func valueAndTail(raw string) (value, tail string) {
+	_, rest, _ := strings.Cut(raw, ":")
+	value, tail, _ = strings.Cut(rest, "|")
+	return value, tail
 }
 
 // sampleRate returns the last @rate segment of the part of a line that follows the value, or 1
@@ -104,7 +131,7 @@ func sampleRate(tail string) (float64, error) {
 // overflow to +Inf, which would stick to the series as much as a NaN.
 const maxCounterValue = 1 << 63
 
-// Aggregator records DogStatsD counters as OpenTelemetry instruments.
+// Aggregator records DogStatsD counters and gauges as OpenTelemetry instruments.
 type Aggregator struct {
 	meter  metric.Meter
 	logger *slog.Logger
@@ -115,8 +142,8 @@ func NewAggregator(meter metric.Meter, logger *slog.Logger) *Aggregator {
 	return &Aggregator{meter: meter, logger: logger}
 }
 
-// Record parses raw and records it when it is a counter. Invalid lines and other metric
-// types are logged and dropped.
+// Record parses raw and records it when it is a counter or a gauge. Invalid lines and other
+// metric types are logged and dropped.
 func (a *Aggregator) Record(ctx context.Context, raw string) {
 	a.logger.Debug("metric received", "raw", raw)
 
@@ -125,11 +152,14 @@ func (a *Aggregator) Record(ctx context.Context, raw string) {
 		a.logger.Warn("invalid metric", "raw", raw, "err", err)
 		return
 	}
-	if m.Type != dogstatsd.Counter {
+	switch m.Type {
+	case dogstatsd.Counter:
+		a.recordCounter(ctx, m)
+	case dogstatsd.Gauge:
+		a.recordGauge(ctx, m)
+	default:
 		a.logger.Debug("metric type not aggregated", "raw", raw, "type", string(m.Type))
-		return
 	}
-	a.recordCounter(ctx, m)
 }
 
 func (a *Aggregator) recordCounter(ctx context.Context, m *dogstatsd.Metric) {
@@ -144,23 +174,49 @@ func (a *Aggregator) recordCounter(ctx context.Context, m *dogstatsd.Metric) {
 		return
 	}
 
-	for k := range m.Tags {
-		if !validTagKey(k) {
-			a.logger.Warn("invalid tag key", "name", m.Name, "key", k)
-			return
-		}
+	attrs, ok := a.attributes(m)
+	if !ok {
+		return
 	}
-
 	counter, err := a.meter.Float64Counter(m.Name, metric.WithDescription("a simple counter"))
 	if err != nil {
 		a.logger.Warn("create counter", "name", m.Name, "err", err)
 		return
 	}
+	counter.Add(ctx, value, metric.WithAttributes(attrs...))
+}
+
+func (a *Aggregator) recordGauge(ctx context.Context, m *dogstatsd.Metric) {
+	value, ok := m.Value.(float64)
+	if !ok {
+		a.logger.Warn("unsupported gauge value", "name", m.Name, "type", fmt.Sprintf("%T", m.Value))
+		return
+	}
+
+	attrs, ok := a.attributes(m)
+	if !ok {
+		return
+	}
+	gauge, err := a.meter.Float64Gauge(m.Name, metric.WithDescription("a simple gauge"))
+	if err != nil {
+		a.logger.Warn("create gauge", "name", m.Name, "err", err)
+		return
+	}
+	gauge.Record(ctx, value, metric.WithAttributes(attrs...))
+}
+
+// attributes turns the tags of m into attributes. It logs and reports false when a tag key
+// can't become a Prometheus label name, in which case the whole metric must be dropped.
+func (a *Aggregator) attributes(m *dogstatsd.Metric) ([]attribute.KeyValue, bool) {
 	attrs := make([]attribute.KeyValue, 0, len(m.Tags))
 	for k, v := range m.Tags {
+		if !validTagKey(k) {
+			a.logger.Warn("invalid tag key", "name", m.Name, "key", k)
+			return nil, false
+		}
 		attrs = append(attrs, attribute.String(k, v))
 	}
-	counter.Add(ctx, value, metric.WithAttributes(attrs...))
+	return attrs, true
 }
 
 // validTagKey reports whether k becomes a usable Prometheus label name: it needs an ASCII

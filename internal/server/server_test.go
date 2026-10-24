@@ -128,6 +128,7 @@ func TestEchoWriterEchoesInput(t *testing.T) {
 	for _, msg := range []string{
 		"users.online:1|c|#country:france",
 		"temperature:21.5|g",
+		"latency:12|h",
 		"not a metric",
 		"",
 		"foo:1|c|",
