@@ -8,7 +8,7 @@
 | --- | --- |
 | `cmd/quicmetrics` | Server command: flags, wiring, `run(ctx, args, stderr) error` |
 | `cmd/quicmetrics-client` | Client that generates realistic counters and gauges (`generator.go`) |
-| `internal/server` | `Server` (QUIC sessions), `Aggregator` (counters and gauges) + `Parse`, `SelfSignedTLSConfig` |
+| `internal/server` | `Server` (QUIC sessions), `Aggregator` (counters, gauges, histograms) + `Parse`, `SelfSignedTLSConfig` |
 | `internal/protocol` | `ALPN` and `DefaultAddr`, shared by both commands |
 
 ## Commands
@@ -41,9 +41,9 @@ go run ./cmd/quicmetrics-client     # generate counters and gauges for 10s (see 
 - The server accepts **one stream per connection** and echoes every `Write` back as an ack.
 - **No framing**: one `Write` is one metric. This only works because the client waits for
   each echo before sending the next metric. Several metrics in one read fail to parse.
-- Only counters (`|c`) and gauges (`|g`) are recorded, with tags as attributes. Invalid lines
-  are logged as warnings, and other metric types at debug level. Both are echoed, but not
-  recorded.
+- Only counters (`|c`), gauges (`|g`), histograms (`|h`) and timers (`|ms`) are recorded, with
+  tags as attributes. Invalid lines are logged as warnings, and other metric types (sets
+  `|s`, ...) at debug level. Both are echoed, but not recorded.
 - Gauges: `temperature:21.5|g|#room:a` records the last value per series (name and tag set) in
   an OTel `Float64Gauge` from the same meter, exported without a `_total` suffix
   (`temperature{room="a"} 21.5`). Any finite float64 is valid, with no 2^63 bound since nothing
@@ -51,6 +51,18 @@ go run ./cmd/quicmetrics-client     # generate counters and gauges for 10s (see 
   not a delta: DogStatsD has no relative gauges. The sample rate is validated like for counters
   (outside (0, 1] is dropped) but not applied to the value. Names, tag keys, UTF-8 and the
   cardinality limit follow the same rules and code paths as counters.
+- Histograms: `latency:12|h|#route:a` and `latency:12|ms|#route:a` (a timer, which DogStatsD
+  treats as a histogram) are recorded in an OTel `Float64Histogram` from the same meter. Both
+  types with the same name share one instrument and one series per tag set. Prometheus gets a
+  classic histogram without unit suffix (`latency_bucket{le="..."}`, `latency_sum`,
+  `latency_count`) with the OTel SDK default buckets `0, 5, 10, 25, 50, 75, 100, 250, 500, 750,
+  1000, 2500, 5000, 7500, 10000` (milliseconds), and a value equal to a bound goes in that
+  bound's bucket (`le="5"` holds 5). There are no per-metric buckets. The value must be finite
+  with a magnitude of at most 2^63 like for counters, because `_sum` accumulates: `NaN`, `±Inf`
+  and larger values are logged and dropped. A negative `|h` is accepted (it lands in `le="0"`
+  and lowers `_sum`); the parser already rejects a negative `|ms`. The sample rate is validated
+  like for counters (outside (0, 1] is dropped) but not applied. Names, tag keys, UTF-8 and the
+  cardinality limit follow the same rules and code paths as counters and gauges.
 - Counter values are recorded as float64 (`1.5` stays `1.5`). `NaN` and values above 2^63
   in magnitude (including `±Inf`) are logged and dropped: the SDK sums them unchecked, and a
   `NaN` or `Inf` sum would stick to the series forever.
@@ -67,6 +79,12 @@ go run ./cmd/quicmetrics-client     # generate counters and gauges for 10s (see 
   (which one that is depends on the order sessions send them); a plain `promhttp` handler
   would answer HTTP 500, so keep `ContinueOnError`.
   `TestCounterAndGaugeWithTheSameNameKeepScrapesWorking` pins this.
+  A histogram `foo` exposes the family `foo` with the series `foo_bucket`, `foo_sum` and
+  `foo_count`, so it coexists with a counter `foo` (`foo_total`) but collides with a gauge `foo`
+  (same family) and with a gauge `foo.count` or `foo.sum` (`foo_count`, `foo_sum`). Same
+  outcome as above: one side disappears from `/metrics` depending on the order, the exporter
+  logs `instrument type conflict` or the gatherer an error, and `ContinueOnError` keeps the
+  scrape at HTTP 200. `TestHistogramCollisionsKeepScrapesWorking` pins this.
 - Metric names must be valid OTel instrument names (start with a letter, then
   `[A-Za-z0-9_.-/]`, up to 255 characters). Other names are logged and dropped.
 - Tag keys need an ASCII letter or digit and must not start with `__`, otherwise the whole
@@ -82,7 +100,8 @@ One client must never take the server down.
   empty segments (`foo:1|c|`) and rejects invalid UTF-8, which would otherwise make every
   later scrape log an error and drop the series (HTTP 500 without `ContinueOnError`). It also
   re-parses counter values, which `dogstatsd.Parse` truncates to `int64`, and sample rates,
-  and rejects non-finite gauges.
+  and rejects non-finite gauges and histogram values that are `NaN` or above 2^63 (the parser
+  lets `NaN` and `+Inf` through for `|h` and `|ms`).
 - client_golang recovers panics in collectors, but a panic still drops every OTel series on
   every scrape. Validate any new client-controlled data before it reaches OTel.
 - `/metrics` uses `promhttp.ContinueOnError`: colliding series (e.g. `a.b` and `a_b`, or `foo`
@@ -94,9 +113,19 @@ One client must never take the server down.
   the two disappear from `/metrics`, see the protocol rules.
 - Negative counter values are recorded, so a counter can go down (Prometheus reads that as
   a reset).
-- Each counter and gauge keeps at most 2000 tag sets (`NewPrometheusMeterProvider`). Beyond
-  that, values go to a single `otel_metric_overflow="true"` series: a sum for a counter, the
-  last overflowing value for a gauge.
+- Each counter, gauge and histogram keeps at most 2000 tag sets (`NewPrometheusMeterProvider`).
+  Beyond that, values go to a single `otel_metric_overflow="true"` series: a sum for a
+  counter, the last overflowing value for a gauge, the merged observations for a histogram.
+- Sample rates are not applied to histograms: a sampled `latency:12|h|@0.1` adds one
+  observation, so `_count` and `_sum` undercount by 1/rate. Recording a value 1/rate times
+  would be unbounded work.
+- Histogram buckets are fixed to the OTel defaults, suited to milliseconds: values in seconds
+  or bytes land in a few buckets.
+- A histogram costs more than a counter. At the 2000 tag sets limit, measured with
+  `BenchmarkRecordHistogramCardinality` and `BenchmarkRecordCardinality`, a histogram holds
+  about 3.9 KB of heap per tag set (about 7.7 MB per name, and 18 lines per tag set on
+  `/metrics`) against about 1.6 KB for a counter (about 3.1 MB per name). Names are not
+  bounded, so a client can still multiply that by creating histograms with different names.
 - A gauge keeps its last value on `/metrics` forever after the client stops sending it: there
   is no staleness or expiry.
 
