@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"math/rand/v2"
 )
 
@@ -36,7 +37,8 @@ const maxConcurrency = 100
 
 // generator produces a stream of DogStatsD metrics that looks like the traffic of a small
 // FaaS platform: a few popular functions, a long tail, mostly successful requests and a
-// trickle of errors, as counters, plus gauges for in-flight executions and memory use.
+// trickle of errors, as counters, plus gauges for in-flight executions and memory use and
+// long-tailed histograms for execution time and request latency, in milliseconds.
 // All randomness comes from one seed so a run can be replayed.
 type generator struct {
 	rng         *rand.Rand
@@ -58,31 +60,46 @@ func newGenerator(seed uint64, functions int) *generator {
 	}
 }
 
-// next returns one DogStatsD counter or gauge line.
+// next returns one DogStatsD counter, gauge or histogram line.
 func (g *generator) next() string {
 	fn := g.pick(g.functions)
 	region := g.pick(regions)
 	switch roll := g.rng.IntN(100); {
-	case roll < 38:
+	case roll < 32:
 		cold := g.rng.IntN(100) < 5
 		return fmt.Sprintf("faas.invocations:%d|c|#function:%s,region:%s,cold_start:%t",
 			1+g.rng.IntN(5), fn, region, cold)
-	case roll < 72:
+	case roll < 61:
 		return fmt.Sprintf("http.requests:%d|c|#function:%s,region:%s,method:%s,status:%s",
 			1+g.rng.IntN(10), fn, region, g.pick(methods), g.pick(statuses))
-	case roll < 82:
+	case roll < 69:
 		return fmt.Sprintf("faas.billed.ms:%d|c|#function:%s,region:%s",
 			10+int(g.rng.ExpFloat64()*120), fn, region)
-	case roll < 85:
+	case roll < 72:
 		return fmt.Sprintf("faas.errors:1|c|#function:%s,region:%s,error:%s",
 			fn, region, g.pick(errorKinds))
-	case roll < 93:
+	case roll < 79:
 		return fmt.Sprintf("faas.concurrency:%d|g|#function:%s,region:%s",
 			g.drift(fn+"/"+region), fn, region)
-	default:
+	case roll < 85:
 		return fmt.Sprintf("faas.memory.utilization:%.3f|g|#function:%s,region:%s",
 			min(max(0.5+0.15*g.rng.NormFloat64(), 0), 1), fn, region)
+	case roll < 94:
+		ms := g.logNormal(80, 1)
+		if g.rng.IntN(100) < 5 {
+			ms *= 4
+		}
+		return fmt.Sprintf("faas.duration:%.2f|h|#function:%s,region:%s", ms, fn, region)
+	default:
+		return fmt.Sprintf("http.latency:%.2f|ms|#function:%s,region:%s,method:%s",
+			g.logNormal(30, 1.1), fn, region, g.pick(methods))
 	}
+}
+
+// logNormal returns a positive value with the given median whose logarithm has a standard
+// deviation of sigma: most values sit near the median and a few are many times larger.
+func (g *generator) logNormal(median, sigma float64) float64 {
+	return median * math.Exp(sigma*g.rng.NormFloat64())
 }
 
 // drift moves the in-flight executions of a series by at most one, so the gauge wanders

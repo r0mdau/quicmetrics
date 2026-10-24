@@ -180,6 +180,8 @@ func startServer(ctx context.Context, t *testing.T) (addr string, reader *sdkmet
 	return listener.Addr().String(), reader
 }
 
+// collectValues flattens the collected metrics into one number per series. A histogram gives
+// two entries, its count and its sum, suffixed with ".count" and ".sum".
 func collectValues(t *testing.T, reader *sdkmetric.ManualReader) map[string]float64 {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
@@ -187,19 +189,28 @@ func collectValues(t *testing.T, reader *sdkmetric.ManualReader) map[string]floa
 		t.Fatalf("collect: %v", err)
 	}
 	values := map[string]float64{}
+	series := func(name string, attrs attribute.Set) string {
+		return name + "{" + attrs.Encoded(attribute.DefaultEncoder()) + "}"
+	}
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
-			var points []metricdata.DataPoint[float64]
 			switch data := m.Data.(type) {
 			case metricdata.Sum[float64]:
-				points = data.DataPoints
+				for _, dp := range data.DataPoints {
+					values[series(m.Name, dp.Attributes)] = dp.Value
+				}
 			case metricdata.Gauge[float64]:
-				points = data.DataPoints
+				for _, dp := range data.DataPoints {
+					values[series(m.Name, dp.Attributes)] = dp.Value
+				}
+			case metricdata.Histogram[float64]:
+				for _, dp := range data.DataPoints {
+					key := series(m.Name, dp.Attributes)
+					values[key+".count"] = float64(dp.Count)
+					values[key+".sum"] = dp.Sum
+				}
 			default:
 				t.Fatalf("metric %q: unexpected aggregation %T", m.Name, m.Data)
-			}
-			for _, dp := range points {
-				values[m.Name+"{"+dp.Attributes.Encoded(attribute.DefaultEncoder())+"}"] = dp.Value
 			}
 		}
 	}
