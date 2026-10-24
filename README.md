@@ -7,8 +7,9 @@ This proof of concept uses:
 - statsd string format for metrics
 
 The `quicmetrics-client` generates realistic FaaS traffic (invocations, HTTP requests,
-billed time, errors, in-flight executions, memory use), so you can watch the counters add up
-and the gauges move in the Prometheus endpoint output.
+billed time, errors, in-flight executions, memory use, execution time, request latency), so you
+can watch the counters add up, the gauges move and the histograms fill their buckets in the
+Prometheus endpoint output.
 
 Libraries used:
 - [quic-go](https://github.com/quic-go/quic-go), a QUIC implementation in pure go
@@ -21,7 +22,7 @@ Libraries used:
 | Path | Role |
 | --- | --- |
 | `cmd/quicmetrics` | Server command: flags, wiring, graceful shutdown |
-| `cmd/quicmetrics-client` | Client that generates realistic counters and gauges |
+| `cmd/quicmetrics-client` | Client that generates realistic counters, gauges and histograms |
 | `internal/server` | QUIC sessions, DogStatsD parsing, OpenTelemetry aggregation, TLS |
 | `internal/protocol` | ALPN and default address shared by server and client |
 
@@ -67,8 +68,11 @@ The client sends four counters, tagged by `function` and `region`: `faas.invocat
 and errors stay rare. It also sends two gauges on about 15% of the lines, tagged by `function`
 and `region`: `faas.concurrency`, the in-flight executions (a whole number that drifts by at
 most one between samples of a series) and `faas.memory.utilization`, a ratio from 0 to 1.
-With all 10 functions, `http.requests` has at most 600 tag sets, well under the server's limit
-of 2000 per counter or gauge.
+Two histograms take another 15% of the lines, with long-tailed values in milliseconds:
+`faas.duration` (`|h`, tagged by `function` and `region`), the execution time, mostly tens to
+hundreds of ms with a tail into seconds and slower cold starts, and `http.latency` (`|ms`,
+also tagged by `method`), the request latency. With all 10 functions, `http.requests` has at
+most 600 tag sets, well under the server's limit of 2000 per counter, gauge or histogram.
 
 A counter adds up, so Prometheus exposes it with a `_total` suffix. A gauge (`|g`) keeps only
 the last value received for each series and is exposed as is, without `_total`. A gauge value
@@ -76,10 +80,18 @@ can be any finite number, and a leading sign is an absolute value, not a delta. 
 (`|@0.5`) is validated like for counters but never scales a gauge. A gauge keeps its last value on `/metrics` after the client stops
 sending it.
 
+A histogram (`|h`, or `|ms` for a timer) records each value in a distribution. Both types
+with the same name share one series, and Prometheus exposes them without a unit suffix as
+`foo_bucket{le="..."}`, `foo_sum` and `foo_count`. The buckets are the OpenTelemetry defaults
+(0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500 and 10000), suited to
+milliseconds, and cannot be configured. A value can be any finite number up to 2^63 in
+magnitude (a timer cannot be negative). A sample rate (`|@0.5`) is validated like for counters
+but never scales a histogram: `_count` and `_sum` only cover the values actually received.
+
 ### Client examples
 
 Send 400 metrics at 200 per second across 4 functions. With a fixed seed, a fresh server
-always ends up with the same 92 counter series (and 17 gauge series):
+always ends up with the same 81 counter series (and 20 gauge series):
 
     $ go run ./cmd/quicmetrics-client -rate 200 -count 400 -functions 4 -seed 7
     level=INFO msg="generating metrics" addr=localhost:4242 seed=7 rate=200 count=400 duration=10s functions=4
@@ -88,9 +100,9 @@ always ends up with the same 92 counter series (and 17 gauge series):
     $ curl -s localhost:2223/metrics | grep -E '^(faas|http)'
     ...
     faas_billed_ms_total{function="checkout",region="eu-west-1"} 366
-    faas_errors_total{error="timeout",function="checkout",region="us-east-1"} 1
-    faas_invocations_total{cold_start="false",function="checkout",region="us-east-1"} 95
-    http_requests_total{function="checkout",method="GET",region="us-east-1",status="200"} 115
+    faas_errors_total{error="timeout",function="checkout",region="us-east-1"} 3
+    faas_invocations_total{cold_start="false",function="checkout",region="us-east-1"} 84
+    http_requests_total{function="checkout",method="GET",region="us-east-1",status="200"} 125
     ...
 
 Other runs:
@@ -151,6 +163,8 @@ Check the metrics:
 - Prometheus UI: open <http://localhost:9090/query>, query
   `sum by (status) (rate(http_requests_total[1m]))` and click **Execute**. Switch to the
   **Graph** tab and run the client with `-duration 0` to watch the request rate by status.
+  For the 95th percentile of the function execution time, query
+  `histogram_quantile(0.95, sum by (le) (rate(faas_duration_bucket[1m])))`.
 - scrape target health: <http://localhost:9090/targets>, the `quicmetrics` job
   should be **UP**
 
