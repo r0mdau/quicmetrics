@@ -38,12 +38,22 @@ go run ./cmd/quicmetrics-client     # generate all metric types for 10s (see -h 
   hardcode them. The container defaults to `-addr 0.0.0.0:4242`.
 - TLS: the server generates a self-signed P-256 certificate at every start, and the client
   uses `InsecureSkipVerify`.
-- The server accepts **one stream per connection** and echoes every `Write` back as an ack.
-- **No framing**: one `Write` is one metric. This only works because the client waits for
-  each echo before sending the next metric. Several metrics in one read fail to parse.
+- The server accepts **one stream per connection**. The stream is a byte stream, so metrics
+  are **newline-delimited**: a line ends with `\n`, a trailing `\r` is dropped, empty lines are
+  skipped (and not acknowledged), and a last line without `\n` is processed when the client
+  closes its side of the stream. Reads may split a line or carry several, the server never
+  depends on how the client chunks its writes.
+- A line is at most `server.MaxLineLength` (8 KiB) without its terminator. A longer line
+  closes the session with QUIC application error code 1 (`line too long`) and a warning,
+  rather than dropping it, because the client is broken and the server would have to discard
+  an unbounded stream to resynchronise. Lines acknowledged before that stay recorded.
+- The server echoes every non-empty line back, terminated by `\n`, as an ack. Invalid lines
+  are acked too. The client sends one line and waits for its ack before the next. An ack
+  written just before the session closes (client FIN, then connection close) may be lost,
+  so a client must read its acks before closing.
 - Only counters (`|c`), gauges (`|g`), histograms (`|h`) and timers (`|ms`) are recorded, with
   tags as attributes. Invalid lines are logged as warnings, and other metric types (sets
-  `|s`, ...) at debug level. Both are echoed, but not recorded.
+  `|s`, ...) at debug level. Both are acked, but not recorded.
 - Gauges: `temperature:21.5|g|#room:a` records the last value per series (name and tag set) in
   an OTel `Float64Gauge` from the same meter, exported without a `_total` suffix
   (`temperature{room="a"} 21.5`). Any finite float64 is valid, with no 2^63 bound since nothing

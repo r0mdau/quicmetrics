@@ -26,6 +26,22 @@ Libraries used:
 | `internal/server` | QUIC sessions, DogStatsD parsing, OpenTelemetry aggregation, TLS |
 | `internal/protocol` | ALPN and default address shared by server and client |
 
+## Wire protocol
+
+A client opens a QUIC connection with the ALPN from `internal/protocol` and one
+bidirectional stream. A stream is a byte stream, so metrics are newline-delimited
+[DogStatsD](https://docs.datadoghq.com/developers/dogstatsd/datagram_shapes/) lines:
+
+- a line ends with `\n`. A trailing `\r` is dropped, empty lines are skipped and a last line
+  without `\n` is processed when the client closes its side of the stream. Several metrics can
+  share one write and one metric can span several writes.
+- a line is at most 8192 bytes (`server.MaxLineLength`) without its terminator. A longer line
+  closes the session with QUIC application error code 1.
+- the server acknowledges every non-empty line by echoing it back, terminated by `\n`, whether
+  or not it could be recorded. The client sends a line and waits for its ack. A client that
+  closes its stream or connection before reading an ack may never get it, although the metric
+  is still recorded.
+
 ## Getting started
 
 Launch the server

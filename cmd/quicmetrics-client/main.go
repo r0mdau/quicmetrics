@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -127,6 +128,7 @@ func sendMetrics(ctx context.Context, logger *slog.Logger, addr string, gen *gen
 	defer func() {
 		logger.Info("metrics acknowledged", "count", sent, "elapsed", time.Since(start).Round(time.Millisecond))
 	}()
+	acks := bufio.NewReader(stream)
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	next := start
@@ -137,7 +139,7 @@ func sendMetrics(ctx context.Context, logger *slog.Logger, addr string, gen *gen
 		case <-timer.C:
 		}
 		m := gen.next()
-		if err := send(stream, m); err != nil {
+		if err := send(stream, acks, m); err != nil {
 			if ctx.Err() != nil {
 				return sent, nil
 			}
@@ -154,15 +156,15 @@ func sendMetrics(ctx context.Context, logger *slog.Logger, addr string, gen *gen
 	return sent, nil
 }
 
-func send(stream *quic.Stream, metric string) error {
-	if _, err := stream.Write([]byte(metric)); err != nil {
+func send(stream *quic.Stream, acks *bufio.Reader, metric string) error {
+	if _, err := stream.Write([]byte(metric + "\n")); err != nil {
 		return fmt.Errorf("send %q: %w", metric, err)
 	}
-	ack := make([]byte, len(metric))
-	if _, err := io.ReadFull(stream, ack); err != nil {
+	ack, err := acks.ReadString('\n')
+	if err != nil {
 		return fmt.Errorf("read ack for %q: %w", metric, err)
 	}
-	if string(ack) != metric {
+	if ack != metric+"\n" {
 		return fmt.Errorf("ack %q does not match sent metric %q", ack, metric)
 	}
 	return nil
