@@ -419,15 +419,15 @@ func TestHandleConnClosesSessionOnLineTooLong(t *testing.T) {
 	sendAndExpectAck(t, newTestClient(stream), "foo:1|c")
 	var appErr *quic.ApplicationError
 	_, err = stream.Write([]byte(strings.Repeat("x", 2*MaxLineLength)))
-	if err != nil && (!errors.As(err, &appErr) || appErr.ErrorCode != errCodeLineTooLong) {
+	if err != nil && (!errors.As(err, &appErr) || appErr.ErrorCode != protocol.CodeLineTooLong) {
 		t.Fatalf("write: %v", err)
 	}
 	waitDone(t, done)
 	assertNoSessionPanic(t, logs)
 
 	_, err = stream.Read(make([]byte, 1))
-	if !errors.As(err, &appErr) || appErr.ErrorCode != errCodeLineTooLong {
-		t.Errorf("read error = %v, want application error code %d", err, errCodeLineTooLong)
+	if !errors.As(err, &appErr) || appErr.ErrorCode != protocol.CodeLineTooLong {
+		t.Errorf("read error = %v, want application error code %d", err, protocol.CodeLineTooLong)
 	}
 	if !strings.Contains(logs.String(), "level=WARN") {
 		t.Errorf("oversized line was not logged as a warning:\n%s", logs.String())
@@ -566,6 +566,110 @@ func TestServeClosesSessionsWhenContextCancelled(t *testing.T) {
 		t.Error("session still open after Serve returned")
 	}
 	assertValues(t, values(collectSums(t, reader)), map[string]float64{"foo{}": 1})
+}
+
+func TestServeRejectsSessionsBeyondTheCap(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	agg, reader := newTestAggregator()
+	var logs syncBuffer
+	srv := New(agg, slog.New(slog.NewTextHandler(&logs, nil)), WithMaxSessions(1))
+	listener := listenServer(t, DefaultIdleTimeout)
+	serveListener(ctx, t, srv, listener)
+
+	stream, err := dialQUIC(ctx, t, listener.Listener).OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	first := newTestClient(stream)
+	sendAndExpectAck(t, first, "foo:1|c")
+
+	rejected := dialQUIC(ctx, t, listener.Listener)
+	select {
+	case <-rejected.Context().Done():
+	case <-ctx.Done():
+		t.Fatal("connection beyond the cap was not closed")
+	}
+	var appErr *quic.ApplicationError
+	if err := context.Cause(rejected.Context()); !errors.As(err, &appErr) ||
+		!appErr.Remote || appErr.ErrorCode != protocol.CodeServerBusy || appErr.ErrorMessage == "" {
+		t.Errorf("close cause = %v, want a remote application error %d with a reason", err, protocol.CodeServerBusy)
+	}
+	if !strings.Contains(logs.String(), "too many sessions") {
+		t.Errorf("rejection was not logged:\n%s", logs.String())
+	}
+
+	sendAndExpectAck(t, first, "foo:2|c")
+	assertValues(t, values(collectSums(t, reader)), map[string]float64{"foo{}": 3})
+}
+
+func TestServeFreesTheSlotWhenASessionEnds(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	agg, _ := newTestAggregator()
+	srv := New(agg, discardLogger, WithMaxSessions(1))
+	listener := listenServer(t, DefaultIdleTimeout)
+	serveListener(ctx, t, srv, listener)
+
+	client := dialQUIC(ctx, t, listener.Listener)
+	stream, err := client.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	sendAndExpectAck(t, newTestClient(stream), "foo:1|c")
+	if err := client.CloseWithError(0, "done"); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	for {
+		stream, err := dialQUIC(ctx, t, listener.Listener).OpenStreamSync(ctx)
+		if err == nil && newTestClient(stream).ackOnce("foo:1|c") == nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("slot of the closed session was never freed")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestIdleSessionIsClosedQuietly(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	agg, _ := newTestAggregator()
+	srv, logs := newCapturingServer(agg)
+	listener := listenServer(t, 500*time.Millisecond)
+	client := dialQUIC(ctx, t, listener.Listener)
+	done := runHandleConn(ctx, t, srv, listener.Listener)
+
+	stream, err := client.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	sendAndExpectAck(t, newTestClient(stream), "foo:1|c")
+	start := time.Now()
+
+	waitDone(t, done)
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("idle session closed after %s, want about 500ms", elapsed)
+	}
+	if strings.Contains(logs.String(), "level=WARN") {
+		t.Errorf("idle close was logged as a warning:\n%s", logs.String())
+	}
+}
+
+func serveListener(ctx context.Context, tb testing.TB, srv *Server, listener *Listener) {
+	tb.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = srv.Serve(ctx, listener.Listener)
+	}()
+	tb.Cleanup(func() { <-done })
 }
 
 func serveQUIC(ctx context.Context, tb testing.TB, srv *Server) *quic.Listener {

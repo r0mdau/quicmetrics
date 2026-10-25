@@ -121,7 +121,7 @@ func sendMetrics(ctx context.Context, logger *slog.Logger, addr string, gen *gen
 	if err != nil {
 		return 0, fmt.Errorf("dial %s: %w", addr, err)
 	}
-	defer func() { _ = conn.CloseWithError(0, "done") }()
+	defer func() { _ = conn.CloseWithError(protocol.CodeNoError, "done") }()
 
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
@@ -137,7 +137,7 @@ func sendMetrics(ctx context.Context, logger *slog.Logger, addr string, gen *gen
 		deadline, _ := sendCtx.Deadline()
 		_ = stream.SetWriteDeadline(deadline)
 	}
-	stopAfterFunc := context.AfterFunc(ctx, func() { _ = conn.CloseWithError(0, "stopped") })
+	stopAfterFunc := context.AfterFunc(ctx, func() { _ = conn.CloseWithError(protocol.CodeNoError, "stopped") })
 	defer stopAfterFunc()
 
 	acks := make(chan ackResult)
@@ -146,7 +146,7 @@ func sendMetrics(ctx context.Context, logger *slog.Logger, addr string, gen *gen
 	reader.Go(func() { readAcks(stream, acks, quit) })
 	defer func() {
 		close(quit)
-		_ = conn.CloseWithError(0, "done")
+		_ = conn.CloseWithError(protocol.CodeNoError, "done")
 		reader.Wait()
 	}()
 

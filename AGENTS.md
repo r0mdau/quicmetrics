@@ -8,8 +8,8 @@
 | --- | --- |
 | `cmd/quicmetrics` | Server command: flags, wiring, `run(ctx, args, stderr) error` |
 | `cmd/quicmetrics-client` | Client that generates realistic counters, gauges and histograms (`generator.go`) and pipelines them in batches |
-| `internal/server` | `Server` (QUIC sessions), `Aggregator` (counters, gauges, histograms) + `Parse`, `SelfSignedTLSConfig` |
-| `internal/protocol` | `ALPN` and `DefaultAddr`, shared by both commands |
+| `internal/server` | `Server` (QUIC sessions), `Listen` + `QUICConfig` (hardened listener), `Aggregator` (counters, gauges, histograms) + `Parse`, `SelfSignedTLSConfig` |
+| `internal/protocol` | `ALPN`, `DefaultAddr` and the QUIC application error codes, shared by both commands |
 
 ## Commands
 
@@ -38,13 +38,15 @@ go run ./cmd/quicmetrics-client     # generate all metric types for 10s (see -h 
   hardcode them. The container defaults to `-addr 0.0.0.0:4242`.
 - TLS: the server generates a self-signed P-256 certificate at every start, and the client
   uses `InsecureSkipVerify`.
-- The server accepts **one stream per connection**. The stream is a byte stream, so metrics
+- The server accepts **one stream per connection**: `server.QUICConfig` allows one
+  bidirectional stream and no unidirectional stream, so a second stream makes `OpenStream` fail
+  with `StreamLimitReachedError` on the client. The stream is a byte stream, so metrics
   are **newline-delimited**: a line ends with `\n`, a trailing `\r` is dropped, empty lines are
   skipped (and not acknowledged), and a last line without `\n` is processed when the client
   closes its side of the stream. Reads may split a line or carry several, the server never
   depends on how the client chunks its writes.
 - A line is at most `server.MaxLineLength` (8 KiB) without its terminator. A longer line
-  closes the session with QUIC application error code 1 (`line too long`) and a warning,
+  closes the session with `protocol.CodeLineTooLong` (1, `line too long`) and a warning,
   rather than dropping it, because the client is broken and the server would have to discard
   an unbounded stream to resynchronise. Lines acknowledged before that stay recorded.
 - **Acks are cumulative counts, the server never echoes metrics.** After it has processed every
@@ -60,6 +62,22 @@ go run ./cmd/quicmetrics-client     # generate all metric types for 10s (see -h 
   lost, and so may the ack for lines processed just before a `line too long` close. A client
   must read its last ack before it closes. The client does: once it stops sending, it waits up
   to 5 seconds for the missing acks and then fails.
+- The listener comes from `server.Listen` (never `quic.ListenAddr`): it owns the UDP socket and a
+  `quic.Transport` whose `VerifySourceAddress` always asks for a Retry, so every client pays one
+  extra round trip and a spoofed source address gets no handshake state. `Listener.Close` only
+  stops accepting (open sessions are closed cleanly by `Serve` on shutdown), and `Release` then
+  frees the socket and abruptly ends what is left: call it last, after `Serve` returned.
+  `QUICConfig` sets explicit idle (`-idle-timeout`, 30s) and handshake (5s) timeouts and small
+  flow-control windows (64 KiB initial and 256 KiB max per stream, 128 KiB and 512 KiB per
+  connection) instead of the quic-go defaults of 6 MB and 15 MB. An idle close is not logged as
+  a warning.
+- Application error codes live in `internal/protocol/errors.go`, one constant each in a single
+  commented block, and are unique: 0 normal close, 1 line too long, 2 server busy. Add new ones
+  there and in the README table.
+- `Server` serves at most `-max-sessions` (default 1000, `server.WithMaxSessions`) sessions at a
+  time. `Serve` closes the others right after the handshake with `protocol.CodeServerBusy` (2)
+  and the reason `too many sessions`, and logs a warning. Tests that call `handleConn` directly
+  bypass the cap.
 - Only counters (`|c`), gauges (`|g`), histograms (`|h`) and timers (`|ms`) are recorded, with
   tags as attributes. Invalid lines are logged as warnings, and other metric types (sets
   `|s`, ...) at debug level. Both are acked, but not recorded.
@@ -155,6 +173,10 @@ One client must never take the server down.
   bounded, so a client can still multiply that by creating histograms with different names.
 - A gauge keeps its last value on `/metrics` forever after the client stops sending it: there
   is no staleness or expiry.
+- A client that completes the handshake and keeps sending packets (but no data) holds a session
+  slot for ever: the idle timeout only fires on silence, and there is no deadline on the first
+  stream or between metrics. The same holds for a client that never reads its acks (the ack
+  write blocks). With `-max-sessions` that means a determined client can fill the cap.
 
 ## Conventions
 

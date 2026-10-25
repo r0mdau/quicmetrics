@@ -15,27 +15,47 @@ import (
 	"sync"
 
 	"github.com/quic-go/quic-go"
+
+	"github.com/r0mdau/quicmetrics/internal/protocol"
 )
 
 // MaxLineLength is the longest line in bytes, without its terminator, that a session accepts.
 const MaxLineLength = 8 << 10
 
-const errCodeLineTooLong quic.ApplicationErrorCode = 1
+// DefaultMaxSessions is the session cap of a Server created without WithMaxSessions.
+const DefaultMaxSessions = 1000
 
 var errLineTooLong = fmt.Errorf("line longer than %d bytes", MaxLineLength)
 
 // Server accepts QUIC connections and feeds every received metric to an Aggregator.
 //
 // Each connection carries one stream of newline-delimited metrics, acknowledged in bulk.
+//
+// A Server runs a bounded number of sessions at once.
 type Server struct {
 	agg      *Aggregator
 	logger   *slog.Logger
 	sessions sync.WaitGroup
+	slots    chan struct{}
+}
+
+// Option customizes a Server.
+type Option func(*Server)
+
+// WithMaxSessions caps concurrent sessions at n; further connections are closed with
+// protocol.CodeServerBusy.
+func WithMaxSessions(n int) Option {
+	return func(s *Server) { s.slots = make(chan struct{}, n) }
 }
 
 // New returns a Server that records metrics with agg and logs to logger.
-func New(agg *Aggregator, logger *slog.Logger) *Server {
-	return &Server{agg: agg, logger: logger}
+func New(agg *Aggregator, logger *slog.Logger, opts ...Option) *Server {
+	s := &Server{agg: agg, logger: logger}
+	WithMaxSessions(DefaultMaxSessions)(s)
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Serve accepts connections on listener until ctx is done or the listener is closed, then
@@ -52,15 +72,24 @@ func (s *Server) Serve(ctx context.Context, listener *quic.Listener) error {
 			}
 			return fmt.Errorf("accept QUIC connection: %w", err)
 		}
-		s.sessions.Go(func() { s.handleConn(ctx, conn) })
+		select {
+		case s.slots <- struct{}{}:
+			s.sessions.Go(func() {
+				defer func() { <-s.slots }()
+				s.handleConn(ctx, conn)
+			})
+		default:
+			s.logger.Warn("too many sessions, connection rejected", "remote", conn.RemoteAddr().String(), "max", cap(s.slots))
+			_ = conn.CloseWithError(protocol.CodeServerBusy, "too many sessions")
+		}
 	}
 }
 
 func (s *Server) handleConn(ctx context.Context, conn *quic.Conn) {
 	logger := s.logger.With("remote", conn.RemoteAddr().String())
 	logger.Info("session accepted")
-	stop := context.AfterFunc(ctx, func() { _ = conn.CloseWithError(0, "server shutting down") })
-	closeCode, closeReason := quic.ApplicationErrorCode(0), "bye"
+	stop := context.AfterFunc(ctx, func() { _ = conn.CloseWithError(protocol.CodeNoError, "server shutting down") })
+	closeCode, closeReason := quic.ApplicationErrorCode(protocol.CodeNoError), "bye"
 	defer func() {
 		stop()
 		if r := recover(); r != nil {
@@ -81,7 +110,7 @@ func (s *Server) handleConn(ctx context.Context, conn *quic.Conn) {
 	switch {
 	case errors.Is(err, errLineTooLong):
 		logger.Warn("closing session", "err", err)
-		closeCode, closeReason = errCodeLineTooLong, "line too long"
+		closeCode, closeReason = protocol.CodeLineTooLong, "line too long"
 	case err != nil && !isExpectedClose(ctx, err):
 		logger.Warn("session ended with error", "err", err)
 	}
@@ -91,8 +120,12 @@ func isExpectedClose(ctx context.Context, err error) bool {
 	if ctx.Err() != nil {
 		return true
 	}
+	var idleErr *quic.IdleTimeoutError
+	if errors.As(err, &idleErr) {
+		return true
+	}
 	var appErr *quic.ApplicationError
-	return errors.As(err, &appErr) && appErr.Remote && appErr.ErrorCode == 0
+	return errors.As(err, &appErr) && appErr.Remote && appErr.ErrorCode == protocol.CodeNoError
 }
 
 func (s *Server) serveStream(ctx context.Context, rw io.ReadWriter) error {

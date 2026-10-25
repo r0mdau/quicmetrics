@@ -20,7 +20,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/quic-go/quic-go"
 
 	"github.com/r0mdau/quicmetrics/internal/protocol"
 	"github.com/r0mdau/quicmetrics/internal/server"
@@ -48,6 +47,8 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	addr := fs.String("addr", protocol.DefaultAddr, "UDP address the QUIC listener binds to")
 	metricsAddr := fs.String("metrics-addr", ":2223", "TCP address of the Prometheus /metrics endpoint")
+	idleTimeout := fs.Duration("idle-timeout", server.DefaultIdleTimeout, "close a session after this long without traffic")
+	maxSessions := fs.Int("max-sessions", server.DefaultMaxSessions, "maximum number of concurrent QUIC sessions, others are rejected")
 	var level slog.Level
 	fs.TextVar(&level, "log-level", slog.LevelInfo, "minimum log level: debug, info, warn or error")
 	if err := fs.Parse(args); err != nil {
@@ -57,6 +58,14 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 		return fmt.Errorf("%w: %w", errUsage, err)
 	}
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level}))
+
+	if *maxSessions < 1 {
+		return fmt.Errorf("-max-sessions must be at least 1, got %d", *maxSessions)
+	}
+	quicConf, err := server.QUICConfig(*idleTimeout)
+	if err != nil {
+		return fmt.Errorf("-idle-timeout: %w", err)
+	}
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(
@@ -73,11 +82,11 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("create TLS config: %w", err)
 	}
-	listener, err := quic.ListenAddr(*addr, tlsConf, nil)
+	listener, err := server.Listen(*addr, tlsConf, quicConf)
 	if err != nil {
 		return fmt.Errorf("listen QUIC on %s: %w", *addr, err)
 	}
-	defer func() { _ = listener.Close() }()
+	defer func() { _ = listener.Release() }()
 
 	httpListener, err := net.Listen("tcp", *metricsAddr)
 	if err != nil {
@@ -91,7 +100,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	})))
 	httpServer := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ErrorLog: errorLog}
 
-	srv := server.New(server.NewAggregator(meter, logger), logger)
+	srv := server.New(server.NewAggregator(meter, logger), logger, server.WithMaxSessions(*maxSessions))
 
 	parent := ctx
 	ctx, cancel := context.WithCancelCause(ctx)
@@ -100,7 +109,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		logger.Info("serving QUIC metrics listener", "addr", listener.Addr().String())
-		if err := srv.Serve(ctx, listener); err != nil {
+		if err := srv.Serve(ctx, listener.Listener); err != nil {
 			cancel(err)
 		}
 	})
