@@ -80,6 +80,10 @@ func (r *CertReloader) Reload() error {
 
 // Watch calls Reload every interval until ctx is done, logging failures.
 func (r *CertReloader) Watch(ctx context.Context, interval time.Duration) {
+	watch(ctx, interval, r.logger, "TLS certificate", r.Reload)
+}
+
+func watch(ctx context.Context, interval time.Duration, logger *slog.Logger, what string, reload func() error) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -87,8 +91,8 @@ func (r *CertReloader) Watch(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := r.Reload(); err != nil {
-				r.logger.Warn("reload TLS certificate failed, keeping the previous one", "err", err)
+			if err := reload(); err != nil {
+				logger.Warn("reload "+what+" failed, keeping the previous one", "err", err)
 			}
 		}
 	}

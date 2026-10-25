@@ -8,7 +8,7 @@
 | --- | --- |
 | `cmd/quicmetrics` | Server command: flags, wiring, `run(ctx, args, stderr) error` |
 | `cmd/quicmetrics-client` | Client that generates realistic counters, gauges and histograms (`generator.go`) and pipelines them in batches |
-| `internal/server` | `Server` (QUIC sessions), `Listen` + `QUICConfig` (hardened listener), `Aggregator` (counters, gauges, histograms) + `Parse`, `CertReloader`, `SelfSignedTLSConfig` |
+| `internal/server` | `Server` (QUIC sessions), `Listen` + `QUICConfig` (hardened listener), `Aggregator` (counters, gauges, histograms) + `Parse`, `CertReloader`, `CAReloader`, `SelfSignedTLSConfig` |
 | `internal/protocol` | `ALPN`, `DefaultAddr` and the QUIC application error codes, shared by both commands |
 | `internal/tlstest` | Test-only CA and certificate issuing, so no key file is committed |
 
@@ -46,6 +46,14 @@ go run ./cmd/quicmetrics-client -insecure  # generate all metric types for 10s (
   the previous certificate stays. A pair that is invalid at start is a fatal startup
   error. Without the flags the server generates a self-signed P-256 certificate at every start
   and logs a warning: development only.
+- mTLS: `-tls-client-ca` (PEM bundle) makes `CAReloader.RequireClientCerts` set
+  `tls.RequireAndVerifyClientCert` with a `GetConfigForClient` that clones the config and
+  injects the current pool per handshake, so the bundle reloads like the certificate (same
+  rules: warned once per content, previous pool kept, fatal if invalid at start). Do not set
+  `GetConfigForClient` elsewhere on that config. `handleConn` logs the client certificate
+  subject as `client_subject`. The client takes `-tls-cert` and `-tls-key` (both or neither)
+  and always presents the certificate through `GetClientCertificate`, even when the server's
+  acceptable CAs don't list it, so the server makes the decision and says why.
 - The client verifies the server by default: against `-tls-ca` (PEM bundle) or the system
   roots, for the host of `-addr` or `-tls-server-name`. `InsecureSkipVerify` is only set by
   `-insecure` (with a warning, and a usage error together with `-tls-ca`), so talking to a
@@ -189,6 +197,9 @@ One client must never take the server down.
   slot for ever: the idle timeout only fires on silence, and there is no deadline on the first
   stream or between metrics. The same holds for a client that never reads its acks (the ack
   write blocks). With `-max-sessions` that means a determined client can fill the cap.
+- With mTLS a rejected client is not logged by the server: `crypto/tls` has no hook for failed
+  client verification. In TLS 1.3 the client only sees the rejection on its first read or
+  write, not when dialing.
 
 ## Conventions
 

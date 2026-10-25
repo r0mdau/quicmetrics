@@ -87,6 +87,9 @@ func (s *Server) Serve(ctx context.Context, listener *quic.Listener) error {
 
 func (s *Server) handleConn(ctx context.Context, conn *quic.Conn) {
 	logger := s.logger.With("remote", conn.RemoteAddr().String())
+	if certs := conn.ConnectionState().TLS.PeerCertificates; len(certs) > 0 {
+		logger = logger.With("client_subject", certs[0].Subject.String())
+	}
 	logger.Info("session accepted")
 	stop := context.AfterFunc(ctx, func() { _ = conn.CloseWithError(protocol.CodeNoError, "server shutting down") })
 	closeCode, closeReason := quic.ApplicationErrorCode(protocol.CodeNoError), "bye"

@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -305,5 +306,98 @@ func TestRunServesTheConfiguredCertificateAndReloadsIt(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("run did not return after cancel")
+	}
+}
+
+func TestRunFailsOnInvalidClientCA(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	broken := filepath.Join(dir, "broken.pem")
+	if err := os.WriteFile(broken, []byte("broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, file := range map[string]string{"missing": filepath.Join(dir, "missing.pem"), "invalid": broken} {
+		err := run(context.Background(), []string{"-addr", "127.0.0.1:0", "-metrics-addr", "127.0.0.1:0", "-tls-client-ca", file}, io.Discard)
+		if err == nil || errors.Is(err, errUsage) || !strings.Contains(err.Error(), "create TLS config") {
+			t.Errorf("%s: run = %v, want a startup error", name, err)
+		}
+	}
+}
+
+func TestRunRequiresClientCertificatesWithTLSClientCA(t *testing.T) {
+	t.Parallel()
+	serverCA, clientCA, otherCA := tlstest.NewCA(t, "server CA"), tlstest.NewCA(t, "client CA"), tlstest.NewCA(t, "other CA")
+	dir := t.TempDir()
+	files := map[string][]byte{"tls.crt": nil, "tls.key": nil, "client-ca.pem": clientCA.PEM}
+	server := serverCA.IssueServer(t, "127.0.0.1")
+	files["tls.crt"], files["tls.key"] = server.CertPEM, server.KeyPEM
+	for name, data := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var logs syncBuffer
+	errc := make(chan error, 1)
+	go func() {
+		errc <- run(ctx, []string{
+			"-addr", "127.0.0.1:0", "-metrics-addr", "127.0.0.1:0",
+			"-tls-cert", filepath.Join(dir, "tls.crt"), "-tls-key", filepath.Join(dir, "tls.key"),
+			"-tls-client-ca", filepath.Join(dir, "client-ca.pem"),
+		}, &logs)
+	}()
+	quicAddr := waitForAddr(t, &logs, quicAddrRe)
+
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(serverCA.PEM)
+	exchange := func(client *tlstest.KeyPair) error {
+		dialCtx, cancelDial := context.WithTimeout(ctx, 5*time.Second)
+		defer cancelDial()
+		conf := &tls.Config{RootCAs: roots, NextProtos: []string{protocol.ALPN}, MinVersion: tls.VersionTLS13}
+		if client != nil {
+			cert, err := tls.X509KeyPair(client.CertPEM, client.KeyPEM)
+			if err != nil {
+				return err
+			}
+			conf.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &cert, nil }
+		}
+		conn, err := quic.DialAddr(dialCtx, quicAddr, conf, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = conn.CloseWithError(0, "") }()
+		stream, err := conn.OpenStreamSync(dialCtx)
+		if err != nil {
+			return err
+		}
+		if _, err := stream.Write([]byte("mtls.hits:1|c\n")); err != nil {
+			return err
+		}
+		ack, err := bufio.NewReader(stream).ReadString('\n')
+		if err == nil && ack != "1\n" {
+			err = fmt.Errorf("ack = %q, want \"1\\n\"", ack)
+		}
+		return err
+	}
+
+	valid, foreign := clientCA.IssueClient(t, "agent-1"), otherCA.IssueClient(t, "agent-2")
+	if err := exchange(&valid); err != nil {
+		t.Errorf("client with a certificate from -tls-client-ca: %v, want accepted", err)
+	}
+	if err := exchange(nil); err == nil {
+		t.Error("client without a certificate was accepted")
+	}
+	if err := exchange(&foreign); err == nil {
+		t.Error("client with a certificate from another CA was accepted")
+	}
+	if !strings.Contains(logs.String(), `client_subject="CN=agent-1"`) || strings.Contains(logs.String(), "agent-2") {
+		t.Errorf("want the accepted client's subject and no other logged:\n%s", logs.String())
+	}
+
+	cancel()
+	if err := <-errc; err != nil {
+		t.Errorf("run = %v, want nil after cancel", err)
 	}
 }

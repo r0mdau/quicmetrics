@@ -89,7 +89,8 @@ Server flags:
 | `-max-sessions` | `1000` | Concurrent QUIC sessions, further connections are closed with application error code 2 (`too many sessions`) |
 | `-tls-cert` | | PEM certificate chain of the QUIC listener, reloaded when the file changes. Needs `-tls-key` |
 | `-tls-key` | | PEM private key of the QUIC listener. Needs `-tls-cert` |
-| `-tls-reload-interval` | `30s` | How often `-tls-cert` and `-tls-key` are checked for changes |
+| `-tls-client-ca` | | PEM bundle of the CAs that sign client certificates, reloaded when the file changes. When set, clients must present a valid certificate (mTLS) |
+| `-tls-reload-interval` | `30s` | How often `-tls-cert`, `-tls-key` and `-tls-client-ca` are checked for changes |
 | `-log-level` | `info` | `debug` also logs every received metric |
 
 The server stops gracefully on `SIGINT` or `SIGTERM`.
@@ -114,6 +115,8 @@ Client flags:
 | `-seed` | `0` | Random seed to replay a run, `0` picks one (logged at start) |
 | `-tls-ca` | system roots | PEM bundle of the CAs that sign the server certificate |
 | `-tls-server-name` | host of `-addr` | Name the server certificate must be valid for |
+| `-tls-cert` | | PEM client certificate chain to present to a server that requires mTLS. Needs `-tls-key` |
+| `-tls-key` | | PEM private key of the client certificate. Needs `-tls-cert` |
 | `-insecure` | `false` | Do not verify the server certificate, with a warning. Development only. Excludes `-tls-ca` |
 | `-log-level` | `info` | `debug` also logs every metric sent |
 
@@ -177,6 +180,31 @@ A private CA and server certificate for local tests, with openssl:
       -extfile <(printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth')
     go run ./cmd/quicmetrics -tls-cert tls.crt -tls-key tls.key
     go run ./cmd/quicmetrics-client -tls-ca ca.pem
+
+#### Client authentication (mTLS)
+
+Anyone who can reach the UDP port can push metrics. With `-tls-client-ca`, the server
+requires every client to present a certificate signed by one of the CAs of that bundle
+(`tls.RequireAndVerifyClientCert`) and logs the subject of the client certificate on the
+`session accepted` and `session closed` lines (`client_subject="CN=agent-1"`). The bundle is
+reloaded like the server certificate: when its content changes, new connections are verified
+against the new CAs and open sessions are left alone. A bundle that can't be loaded is logged
+as a warning and the previous one stays; at start it must hold at least one certificate.
+
+The client presents its certificate with `-tls-cert` and `-tls-key`. Client certificates need
+the `clientAuth` extended key usage. A client without a certificate, or with one from another
+CA, can't send metrics. In TLS 1.3 the client finishes its side of the handshake before the
+server checks its certificate, so the rejection shows up on the client as an error on the
+first write or read (`send N metrics: ...` or `read ack: ...`, ending in `tls: certificate
+required` or `tls: bad certificate`) rather than at connect time, and no metric is
+acknowledged. The server doesn't log rejected clients.
+
+    openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+      -subj /CN=agent-1 -keyout client.key -out client.csr
+    openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -days 30 -out client.crt \
+      -extfile <(printf 'extendedKeyUsage=clientAuth')
+    go run ./cmd/quicmetrics -tls-cert tls.crt -tls-key tls.key -tls-client-ca ca.pem
+    go run ./cmd/quicmetrics-client -tls-ca ca.pem -tls-cert client.crt -tls-key client.key
 
 ### Client examples
 

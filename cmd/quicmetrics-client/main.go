@@ -74,6 +74,8 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	var tlsOpts tlsOptions
 	fs.StringVar(&tlsOpts.caFile, "tls-ca", "", "PEM bundle of the CAs that sign the server certificate, default is the system roots")
 	fs.StringVar(&tlsOpts.serverName, "tls-server-name", "", "name the server certificate must be valid for, default is the host of -addr")
+	fs.StringVar(&tlsOpts.certFile, "tls-cert", "", "PEM client certificate chain to present to a server that requires mTLS (with -tls-key)")
+	fs.StringVar(&tlsOpts.keyFile, "tls-key", "", "PEM private key of the client certificate (with -tls-cert)")
 	fs.BoolVar(&tlsOpts.insecure, "insecure", false, "do not verify the server certificate (development only, for the self-signed certificate of a server without -tls-cert)")
 	var level slog.Level
 	fs.TextVar(&level, "log-level", slog.LevelInfo, "minimum log level: debug also logs every metric sent")

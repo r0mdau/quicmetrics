@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"github.com/quic-go/quic-go"
 
 	"github.com/r0mdau/quicmetrics/internal/protocol"
+	"github.com/r0mdau/quicmetrics/internal/tlstest"
 )
 
 const testTimeout = 5 * time.Second
@@ -482,6 +484,40 @@ func TestHandleConnAcknowledgesPipelinedBatchesInBulk(t *testing.T) {
 	assertNoSessionPanic(t, logs)
 
 	assertValues(t, values(collectSums(t, reader)), map[string]float64{"foo{a=x}": batches * perBatch})
+}
+
+func TestHandleConnLogsTheClientCertificateSubject(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	serverCA, clientCA := tlstest.NewCA(t, "server CA"), tlstest.NewCA(t, "client CA")
+	file := filepath.Join(t.TempDir(), "ca.pem")
+	writeFile(t, file, clientCA.PEM)
+	cas, _ := newTestCAReloader(t, file)
+	listener := listenMTLS(t, serverCA, cas)
+	agg, _ := newTestAggregator()
+	srv, logs := newCapturingServer(agg)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := listener.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		srv.handleConn(ctx, conn)
+	}()
+	client := clientCA.IssueClient(t, "agent-7")
+	if err := exchangeWithClientCert(ctx, listener, serverCA, &client); err != nil {
+		t.Fatalf("exchange: %v", err)
+	}
+	waitDone(t, done)
+	for _, want := range []string{"session accepted", "session closed", `client_subject="CN=agent-7"`} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("logs missing %q:\n%s", want, logs.String())
+		}
+	}
 }
 
 func TestHandleConnTreatsClientCloseAsClean(t *testing.T) {
