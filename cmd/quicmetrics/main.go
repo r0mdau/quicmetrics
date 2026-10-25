@@ -62,6 +62,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	fs.IntVar(&limits.MaxTags, "max-tags", limits.MaxTags, "maximum number of tags per metric, 0 for no limit")
 	fs.IntVar(&limits.MaxTagKeyLen, "max-tag-key-len", limits.MaxTagKeyLen, "maximum length of a tag key in bytes, 0 for no limit")
 	fs.IntVar(&limits.MaxTagValueLen, "max-tag-value-len", limits.MaxTagValueLen, "maximum length of a tag value in bytes, 0 for no limit")
+	seriesTTL := fs.Duration("series-ttl", server.DefaultSeriesTTL, "forget a series no metric updated for this long, 0 to keep every series")
 	var level slog.Level
 	fs.TextVar(&level, "log-level", slog.LevelInfo, "minimum log level: debug, info, warn or error")
 	if err := fs.Parse(args); err != nil {
@@ -78,6 +79,8 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 		invalid = fmt.Errorf("-tls-reload-interval must be positive, got %v", *tlsReload)
 	case min(limits.MaxNames, limits.MaxTags, limits.MaxTagKeyLen, limits.MaxTagValueLen) < 0:
 		invalid = fmt.Errorf("-max-metric-names, -max-tags, -max-tag-key-len and -max-tag-value-len must not be negative, got %+v", limits)
+	case *seriesTTL < 0:
+		invalid = fmt.Errorf("-series-ttl must not be negative, got %v", *seriesTTL)
 	}
 	if invalid != nil {
 		fmt.Fprintln(stderr, "quicmetrics:", invalid)
@@ -98,7 +101,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
-	provider, err := server.NewPrometheusMeterProvider(registry)
+	provider, err := server.NewPrometheusMeterProvider(registry, server.WithSeriesTTL(*seriesTTL))
 	if err != nil {
 		return err
 	}

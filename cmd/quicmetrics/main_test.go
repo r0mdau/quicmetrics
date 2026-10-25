@@ -174,6 +174,8 @@ func TestRunFlags(t *testing.T) {
 		{"-max-tags", "-1"},
 		{"-max-tag-key-len", "-1"},
 		{"-max-tag-value-len", "-1"},
+		{"-series-ttl", "-1s"},
+		{"-series-ttl", "soon"},
 	} {
 		if err := run(context.Background(), args, io.Discard); !errors.Is(err, errUsage) {
 			t.Errorf("run %v = %v, want errUsage", args, err)
@@ -463,6 +465,64 @@ func TestRunAppliesLimitFlags(t *testing.T) {
 	}
 	if strings.Contains(string(body), "other_hits") {
 		t.Errorf("/metrics exposes a metric over -max-metric-names:\n%s", body)
+	}
+
+	cancel()
+	if err := <-errc; err != nil {
+		t.Errorf("run = %v, want nil after cancel", err)
+	}
+}
+
+func TestRunExpiresIdleSeries(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var logs syncBuffer
+	errc := make(chan error, 1)
+	go func() {
+		errc <- run(ctx, []string{"-addr", "127.0.0.1:0", "-metrics-addr", "127.0.0.1:0", "-series-ttl", "300ms"}, &logs)
+	}()
+	quicAddr := waitForAddr(t, &logs, quicAddrRe)
+	httpAddr := waitForAddr(t, &logs, httpAddrRe)
+
+	dialCtx, cancelDial := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelDial()
+	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{protocol.ALPN}, MinVersion: tls.VersionTLS13}
+	conn, err := quic.DialAddr(dialCtx, quicAddr, tlsConf, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.CloseWithError(0, "") }()
+	stream, err := conn.OpenStreamSync(dialCtx)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	sendMetrics(t, stream, "fleeting.hits:3|c|#fn:a", "fleeting.level:1|g")
+
+	scrape := func() string {
+		resp, err := (&http.Client{Timeout: 5 * time.Second}).Get("http://" + httpAddr + "/metrics")
+		if err != nil {
+			t.Fatalf("GET /metrics: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		return string(body)
+	}
+	if body := scrape(); !strings.Contains(body, `fleeting_hits_total{fn="a"} 3`) || !strings.Contains(body, "fleeting_level 1") {
+		t.Fatalf("/metrics before the TTL:\n%s", body)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for body := scrape(); strings.Contains(body, "fleeting_"); body = scrape() {
+		if time.Now().After(deadline) {
+			t.Fatalf("series still exposed after the TTL:\n%s", body)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if body := scrape(); !strings.Contains(body, "quicmetrics_series_expired_total 2") {
+		t.Errorf("/metrics does not count the 2 expired series:\n%s", body)
 	}
 
 	cancel()

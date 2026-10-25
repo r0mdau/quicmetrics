@@ -95,6 +95,7 @@ Server flags:
 | `-max-tags` | `20` | Tags per metric, `0` for no limit |
 | `-max-tag-key-len` | `64` | Bytes in a tag key, `0` for no limit |
 | `-max-tag-value-len` | `200` | Bytes in a tag value, `0` for no limit |
+| `-series-ttl` | `15m` | A series no metric updated for this long disappears from `/metrics`, `0` keeps every series |
 | `-log-level` | `info` | `debug` also logs every received metric |
 
 The server stops gracefully on `SIGINT` or `SIGTERM`.
@@ -115,6 +116,15 @@ per reason and minute. Metric names starting with `quicmetrics.`, `quicmetrics_`
 or `quicmetrics/` are reserved for the server's own metrics. The limits bound the memory a client
 can use, but not to a small number: every name may still hold up to 2000 tag sets, which
 can reach gigabytes with 1000 histograms and long tags. Lower `-max-metric-names` where memory is tight.
+
+A series (a name with a tag set) that no metric updated for `-series-ttl` is removed from
+`/metrics` and its memory is freed, which suits short-lived FaaS tags. The TTL is checked at each
+scrape, so a series lives up to one scrape interval longer. A series that comes back starts again
+from zero, like a counter that reset, which Prometheus handles in `rate()` and `increase()` (the
+first increment after the series comes back is not counted). A gauge set less often than the TTL
+therefore disappears between updates: raise the TTL, or use `0` to keep every series forever.
+Names never expire: a name that stopped being sent keeps its slot of `-max-metric-names` until
+the server restarts. `quicmetrics_series_expired_total` counts the series removed.
 
 Client flags:
 
@@ -150,8 +160,8 @@ gauge or histogram.
 A counter adds up, so Prometheus exposes it with a `_total` suffix. A gauge (`|g`) keeps only
 the last value received for each series and is exposed as is, without `_total`. A gauge value
 can be any finite number, and a leading sign is an absolute value, not a delta. A sample rate
-(`|@0.5`) is validated like for counters but never scales a gauge. A gauge keeps its last value on `/metrics` after the client stops
-sending it.
+(`|@0.5`) is validated like for counters but never scales a gauge. A gauge keeps its last value
+on `/metrics` after the client stops sending it, until the series expires, see `-series-ttl`.
 
 A histogram (`|h`, or `|ms` for a timer) records each value in a distribution. Both types
 with the same name share one series, and Prometheus exposes them without a unit suffix as
