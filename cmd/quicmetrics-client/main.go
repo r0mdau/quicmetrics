@@ -71,6 +71,10 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	fs.IntVar(&opts.batch, "batch", defaultBatch, fmt.Sprintf("maximum metrics per write (1-%d), lines due together share a write", maxBatch))
 	functions := fs.Int("functions", 5, fmt.Sprintf("number of simulated functions (1-%d), drives tag cardinality", len(functionNames)))
 	seed := fs.Uint64("seed", 0, "random seed to replay a run, 0 picks one")
+	var tlsOpts tlsOptions
+	fs.StringVar(&tlsOpts.caFile, "tls-ca", "", "PEM bundle of the CAs that sign the server certificate, default is the system roots")
+	fs.StringVar(&tlsOpts.serverName, "tls-server-name", "", "name the server certificate must be valid for, default is the host of -addr")
+	fs.BoolVar(&tlsOpts.insecure, "insecure", false, "do not verify the server certificate (development only, for the self-signed certificate of a server without -tls-cert)")
 	var level slog.Level
 	fs.TextVar(&level, "log-level", slog.LevelInfo, "minimum log level: debug also logs every metric sent")
 	if err := fs.Parse(args); err != nil {
@@ -100,10 +104,20 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	if *seed == 0 {
 		*seed = rand.Uint64() //nolint:gosec // simulated traffic, not security sensitive
 	}
+	tlsConf, err := tlsOpts.tlsConfig()
+	if errors.Is(err, errUsage) {
+		fmt.Fprintln(stderr, "quicmetrics-client:", err)
+	}
+	if err != nil {
+		return err
+	}
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level}))
+	if tlsOpts.insecure {
+		logger.Warn("-insecure: the server certificate is not verified, for development only")
+	}
 	logger.Info("generating metrics", "addr", *addr, "seed", *seed, "rate", *rate,
 		"count", opts.count, "duration", opts.duration, "batch", opts.batch, "functions", *functions)
-	if _, err := sendMetrics(ctx, logger, *addr, newGenerator(*seed, *functions), opts); err != nil && ctx.Err() == nil {
+	if _, err := sendMetrics(ctx, logger, *addr, tlsConf, newGenerator(*seed, *functions), opts); err != nil && ctx.Err() == nil {
 		return err
 	}
 	return nil
@@ -111,12 +125,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 
 // sendMetrics sends generated metrics until opts.count, opts.duration or ctx stops it, and
 // returns how many were acknowledged. Stopping once connected is not an error.
-func sendMetrics(ctx context.Context, logger *slog.Logger, addr string, gen *generator, opts options) (acked int, err error) {
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true, //nolint:gosec // the server uses a throwaway self-signed certificate
-		NextProtos:         []string{protocol.ALPN},
-		MinVersion:         tls.VersionTLS13,
-	}
+func sendMetrics(ctx context.Context, logger *slog.Logger, addr string, tlsConf *tls.Config, gen *generator, opts options) (acked int, err error) {
 	conn, err := quic.DialAddr(ctx, addr, tlsConf, nil)
 	if err != nil {
 		return 0, fmt.Errorf("dial %s: %w", addr, err)

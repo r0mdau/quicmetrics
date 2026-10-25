@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"log/slog"
@@ -26,7 +27,7 @@ func TestSendMetricsDeliversGeneratedMetrics(t *testing.T) {
 	addr, reader := startServer(ctx, t)
 
 	const seed, functions, count = 99, 3, 200
-	sent, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, newGenerator(seed, functions), options{count: count})
+	sent, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, insecureTLS(t), newGenerator(seed, functions), options{count: count})
 	if err != nil {
 		t.Fatalf("sendMetrics: %v", err)
 	}
@@ -69,7 +70,7 @@ func TestSendMetricsDeliversBatches(t *testing.T) {
 			addr, reader := startServer(ctx, t)
 
 			const seed, functions = 5, 4
-			acked, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, newGenerator(seed, functions), tt.opts)
+			acked, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, insecureTLS(t), newGenerator(seed, functions), tt.opts)
 			if err != nil {
 				t.Fatalf("sendMetrics: %v", err)
 			}
@@ -98,7 +99,7 @@ func TestSendMetricsLogsEverySentMetricAtDebug(t *testing.T) {
 
 	var logs strings.Builder
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	if _, err := sendMetrics(ctx, logger, addr, newGenerator(1, 1), options{count: 30, batch: 10}); err != nil {
+	if _, err := sendMetrics(ctx, logger, addr, insecureTLS(t), newGenerator(1, 1), options{count: 30, batch: 10}); err != nil {
 		t.Fatalf("sendMetrics: %v", err)
 	}
 	if got := strings.Count(logs.String(), `msg="metric sent"`); got != 30 {
@@ -127,7 +128,7 @@ func TestSendMetricsRejectsInvalidAcks(t *testing.T) {
 			defer cancel()
 			addr := startAckServer(ctx, t, tt.ack)
 
-			_, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, newGenerator(1, 1), options{count: 3, batch: 3})
+			_, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, insecureTLS(t), newGenerator(1, 1), options{count: 3, batch: 3})
 			if err == nil {
 				t.Fatal("sendMetrics accepted an invalid ack")
 			}
@@ -141,7 +142,7 @@ func TestSendMetricsFailsWhenServerCloses(t *testing.T) {
 	defer cancel()
 	addr := startAckServer(ctx, t, "")
 
-	if _, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, newGenerator(1, 1), options{count: 3, batch: 3}); err == nil {
+	if _, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, insecureTLS(t), newGenerator(1, 1), options{count: 3, batch: 3}); err == nil {
 		t.Fatal("sendMetrics returned nil although the server closed the session without acks")
 	}
 }
@@ -153,7 +154,7 @@ func TestSendMetricsStopsAfterDuration(t *testing.T) {
 	addr, _ := startServer(ctx, t)
 
 	start := time.Now()
-	sent, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, newGenerator(1, 1), options{interval: 10 * time.Millisecond, duration: 300 * time.Millisecond})
+	sent, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, insecureTLS(t), newGenerator(1, 1), options{interval: 10 * time.Millisecond, duration: 300 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("sendMetrics: %v", err)
 	}
@@ -171,7 +172,7 @@ func TestSendMetricsSendsFirstMetricWithoutWaiting(t *testing.T) {
 	defer cancel()
 	addr, _ := startServer(ctx, t)
 
-	sent, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, newGenerator(1, 1), options{interval: 10 * time.Second, duration: 500 * time.Millisecond})
+	sent, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, insecureTLS(t), newGenerator(1, 1), options{interval: 10 * time.Second, duration: 500 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("sendMetrics: %v", err)
 	}
@@ -195,7 +196,7 @@ func TestSendMetricsUnpacedStopsOnCancel(t *testing.T) {
 		cancel()
 	}()
 	start := time.Now()
-	if _, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, newGenerator(1, 1), options{}); err != nil {
+	if _, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, insecureTLS(t), newGenerator(1, 1), options{}); err != nil {
 		t.Fatalf("sendMetrics: %v", err)
 	}
 	if serverCtx.Err() != nil {
@@ -210,7 +211,7 @@ func TestSendMetricsFailsWithoutServer(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	if _, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), "127.0.0.1:1", newGenerator(1, 1), options{count: 1}); err == nil {
+	if _, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), "127.0.0.1:1", insecureTLS(t), newGenerator(1, 1), options{count: 1}); err == nil {
 		t.Fatal("sendMetrics returned nil without a server")
 	}
 }
@@ -295,17 +296,31 @@ func startAckServer(ctx context.Context, t *testing.T, ack string) (addr string)
 	return listener.Addr().String()
 }
 
+func insecureTLS(t *testing.T) *tls.Config {
+	t.Helper()
+	conf, err := tlsOptions{insecure: true}.tlsConfig()
+	if err != nil {
+		t.Fatalf("tlsConfig: %v", err)
+	}
+	return conf
+}
+
 func startServer(ctx context.Context, t *testing.T) (addr string, reader *sdkmetric.ManualReader) {
+	t.Helper()
+	tlsConf, err := server.SelfSignedTLSConfig()
+	if err != nil {
+		t.Fatalf("TLS config: %v", err)
+	}
+	return startTLSServer(ctx, t, tlsConf)
+}
+
+func startTLSServer(ctx context.Context, t *testing.T, tlsConf *tls.Config) (addr string, reader *sdkmetric.ManualReader) {
 	t.Helper()
 	logger := slog.New(slog.DiscardHandler)
 	reader = sdkmetric.NewManualReader()
 	meter := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
 	srv := server.New(server.NewAggregator(meter, logger), logger)
 
-	tlsConf, err := server.SelfSignedTLSConfig()
-	if err != nil {
-		t.Fatalf("TLS config: %v", err)
-	}
 	listener, err := quic.ListenAddr("127.0.0.1:0", tlsConf, nil)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
