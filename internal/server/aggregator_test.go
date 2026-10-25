@@ -32,8 +32,8 @@ func newTestAggregator() (*Aggregator, sdkmetric.Reader) {
 }
 
 // collect returns the sums, gauges and histograms recorded so far, keyed by name and
-// attributes. It fails on any other aggregation, so a metric that ends up with an unexpected
-// kind is not skipped.
+// attributes, except the counter of dropped metrics, see collectDropped. It fails on any other
+// aggregation, so a metric that ends up with an unexpected kind is not skipped.
 func collect(t testing.TB, reader sdkmetric.Reader) (
 	map[string]metricdata.Sum[float64], map[string]float64, map[string]metricdata.HistogramDataPoint[float64],
 ) {
@@ -47,6 +47,9 @@ func collect(t testing.TB, reader sdkmetric.Reader) (
 	histograms := map[string]metricdata.HistogramDataPoint[float64]{}
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
+			if m.Name == droppedMetricName {
+				continue
+			}
 			switch data := m.Data.(type) {
 			case metricdata.Sum[float64]:
 				for _, dp := range data.DataPoints {
@@ -1074,16 +1077,16 @@ func TestRecordAllocations(t *testing.T) {
 		raw       string
 		maxAllocs float64
 	}{
-		{"counter_4_tags", taggedLine(4), 14},
+		{"counter_4_tags", taggedLine(4), 13},
 		// One more than an integer: Parse boxes the float64 that replaces the parser's int64.
-		{"float_counter_4_tags", strings.Replace(taggedLine(4), ":1|", ":1.5|", 1), 15},
+		{"float_counter_4_tags", strings.Replace(taggedLine(4), ":1|", ":1.5|", 1), 14},
 		// Parse boxes the scaled float64 just like a fractional value.
-		{"sampled_counter_4_tags", strings.Replace(taggedLine(4), ":1|c", ":1|c|@0.1", 1), 15},
+		{"sampled_counter_4_tags", strings.Replace(taggedLine(4), ":1|c", ":1|c|@0.1", 1), 14},
 		// The parser already boxes the float64, so a gauge or a histogram costs as much as an
 		// integer counter.
-		{"gauge_4_tags", gaugeLine(4), 14},
-		{"histogram_4_tags", histogramLine(4), 14},
-		{"timer_4_tags", strings.Replace(histogramLine(4), "|h", "|ms", 1), 14},
+		{"gauge_4_tags", gaugeLine(4), 13},
+		{"histogram_4_tags", histogramLine(4), 13},
+		{"timer_4_tags", strings.Replace(histogramLine(4), "|h", "|ms", 1), 13},
 		{"set_dropped", "bench.users:alice|s", 7},
 	}
 	for _, tt := range tests {

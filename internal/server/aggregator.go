@@ -8,6 +8,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/narqo/go-dogstatsd-parser"
@@ -160,17 +161,35 @@ const maxCounterValue = 1 << 63
 // Aggregator records DogStatsD counters, gauges, histograms and timers as OpenTelemetry
 // instruments. Histograms and timers share one Float64Histogram per name.
 type Aggregator struct {
-	meter  metric.Meter
-	logger *slog.Logger
+	meter       metric.Meter
+	logger      *slog.Logger
+	limits      Limits
+	now         func() time.Time
+	instruments *instruments
+	drops       *drops
+}
+
+// AggregatorOption configures an Aggregator.
+type AggregatorOption func(*Aggregator)
+
+// WithLimits replaces DefaultLimits.
+func WithLimits(limits Limits) AggregatorOption {
+	return func(a *Aggregator) { a.limits = limits }
 }
 
 // NewAggregator returns an Aggregator that records into meter and logs to logger.
-func NewAggregator(meter metric.Meter, logger *slog.Logger) *Aggregator {
-	return &Aggregator{meter: meter, logger: logger}
+func NewAggregator(meter metric.Meter, logger *slog.Logger, opts ...AggregatorOption) *Aggregator {
+	a := &Aggregator{meter: meter, logger: logger, limits: DefaultLimits(), now: time.Now}
+	for _, opt := range opts {
+		opt(a)
+	}
+	a.instruments = newInstruments(a.limits.MaxNames)
+	a.drops = newDrops(meter, logger, a.now)
+	return a
 }
 
 // Record parses raw and records it when it is a counter, a gauge, a histogram or a timer.
-// Invalid lines and other metric types are logged and dropped.
+// Invalid lines and other metric types are logged and dropped, and so are metrics over a limit.
 func (a *Aggregator) Record(ctx context.Context, raw string) {
 	a.logger.Debug("metric received", "raw", raw)
 
@@ -203,13 +222,15 @@ func (a *Aggregator) recordCounter(ctx context.Context, m *dogstatsd.Metric) {
 		return
 	}
 
-	attrs, ok := a.attributes(m)
+	attrs, ok := a.attributes(ctx, m)
 	if !ok {
 		return
 	}
-	counter, err := a.meter.Float64Counter(m.Name, metric.WithDescription("a simple counter"))
+	counter, err := lookup(a.instruments, a.instruments.counters, m.Name, func() (metric.Float64Counter, error) {
+		return a.meter.Float64Counter(m.Name, metric.WithDescription("a simple counter"))
+	})
 	if err != nil {
-		a.logger.Warn("create counter", "name", m.Name, "err", err)
+		a.instrumentError(ctx, "create counter", m.Name, err)
 		return
 	}
 	counter.Add(ctx, value, metric.WithAttributes(attrs...))
@@ -222,13 +243,15 @@ func (a *Aggregator) recordGauge(ctx context.Context, m *dogstatsd.Metric) {
 		return
 	}
 
-	attrs, ok := a.attributes(m)
+	attrs, ok := a.attributes(ctx, m)
 	if !ok {
 		return
 	}
-	gauge, err := a.meter.Float64Gauge(m.Name, metric.WithDescription("a simple gauge"))
+	gauge, err := lookup(a.instruments, a.instruments.gauges, m.Name, func() (metric.Float64Gauge, error) {
+		return a.meter.Float64Gauge(m.Name, metric.WithDescription("a simple gauge"))
+	})
 	if err != nil {
-		a.logger.Warn("create gauge", "name", m.Name, "err", err)
+		a.instrumentError(ctx, "create gauge", m.Name, err)
 		return
 	}
 	gauge.Record(ctx, value, metric.WithAttributes(attrs...))
@@ -241,23 +264,54 @@ func (a *Aggregator) recordHistogram(ctx context.Context, m *dogstatsd.Metric) {
 		return
 	}
 
-	attrs, ok := a.attributes(m)
+	attrs, ok := a.attributes(ctx, m)
 	if !ok {
 		return
 	}
-	histogram, err := a.meter.Float64Histogram(m.Name, metric.WithDescription("a simple histogram"))
+	histogram, err := lookup(a.instruments, a.instruments.histograms, m.Name, func() (metric.Float64Histogram, error) {
+		return a.meter.Float64Histogram(m.Name, metric.WithDescription("a simple histogram"))
+	})
 	if err != nil {
-		a.logger.Warn("create histogram", "name", m.Name, "err", err)
+		a.instrumentError(ctx, "create histogram", m.Name, err)
 		return
 	}
 	histogram.Record(ctx, value, metric.WithAttributes(attrs...))
 }
 
-// attributes turns the tags of m into attributes. It logs and reports false when a tag key
-// can't become a Prometheus label name, in which case the whole metric must be dropped.
-func (a *Aggregator) attributes(m *dogstatsd.Metric) ([]attribute.KeyValue, bool) {
+func (a *Aggregator) lineTooLong(ctx context.Context, client string) {
+	a.drops.record(ctx, dropLineTooLong, client, MaxLineLength)
+}
+
+func (a *Aggregator) instrumentError(ctx context.Context, msg, name string, err error) {
+	switch {
+	case errors.Is(err, errNamesFull):
+		a.drops.record(ctx, dropNames, name, a.limits.MaxNames)
+	case errors.Is(err, errInvalidName):
+		a.drops.record(ctx, dropInvalidName, name, 0)
+	default:
+		a.logger.Warn(msg, "name", name, "err", err)
+	}
+}
+
+func (a *Aggregator) attributes(ctx context.Context, m *dogstatsd.Metric) ([]attribute.KeyValue, bool) {
+	if reservedName(m.Name) {
+		a.drops.record(ctx, dropReservedName, m.Name, 0)
+		return nil, false
+	}
+	if limit := a.limits.MaxTags; limit > 0 && len(m.Tags) > limit {
+		a.drops.record(ctx, dropTags, m.Name, limit)
+		return nil, false
+	}
 	attrs := make([]attribute.KeyValue, 0, len(m.Tags))
 	for k, v := range m.Tags {
+		if limit := a.limits.MaxTagKeyLen; limit > 0 && len(k) > limit {
+			a.drops.record(ctx, dropTagKeyLength, m.Name, limit)
+			return nil, false
+		}
+		if limit := a.limits.MaxTagValueLen; limit > 0 && len(v) > limit {
+			a.drops.record(ctx, dropTagValueLength, m.Name, limit)
+			return nil, false
+		}
 		if !validTagKey(k) {
 			a.logger.Warn("invalid tag key", "name", m.Name, "key", k)
 			return nil, false

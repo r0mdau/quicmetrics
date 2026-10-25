@@ -8,7 +8,7 @@
 | --- | --- |
 | `cmd/quicmetrics` | Server command: flags, wiring, `run(ctx, args, stderr) error` |
 | `cmd/quicmetrics-client` | Client that generates realistic counters, gauges and histograms (`generator.go`) and pipelines them in batches |
-| `internal/server` | `Server` (QUIC sessions), `Listen` + `QUICConfig` (hardened listener), `Aggregator` (counters, gauges, histograms) + `Parse`, `CertReloader`, `CAReloader`, `SelfSignedTLSConfig` |
+| `internal/server` | `Server` (QUIC sessions), `Listen` + `QUICConfig` (hardened listener), `Aggregator` (counters, gauges, histograms) + `Parse`, `Limits` (`limits.go`), `CertReloader`, `CAReloader`, `SelfSignedTLSConfig` |
 | `internal/protocol` | `ALPN`, `DefaultAddr` and the QUIC application error codes, shared by both commands |
 | `internal/tlstest` | Test-only CA and certificate issuing, so no key file is committed |
 
@@ -66,9 +66,10 @@ go run ./cmd/quicmetrics-client -insecure  # generate all metric types for 10s (
   closes its side of the stream. Reads may split a line or carry several, the server never
   depends on how the client chunks its writes.
 - A line is at most `server.MaxLineLength` (8 KiB) without its terminator. A longer line
-  closes the session with `protocol.CodeLineTooLong` (1, `line too long`) and a warning,
-  rather than dropping it, because the client is broken and the server would have to discard
-  an unbounded stream to resynchronise. Lines acknowledged before that stay recorded.
+  closes the session with `protocol.CodeLineTooLong` (1, `line too long`) rather than dropping
+  the line, because the client is broken and the server would have to discard an unbounded stream
+  to resynchronise. The close is counted as one `line_too_long` drop, which logs at most once per
+  minute like the other limits. Lines acknowledged before that stay recorded.
 - **Acks are cumulative counts, the server never echoes metrics.** After it has processed every
   complete line it has read, and before it blocks for more bytes, the server writes the number
   of non-empty lines processed on the stream so far, in ASCII decimal, terminated by `\n`
@@ -146,9 +147,30 @@ go run ./cmd/quicmetrics-client -insecure  # generate all metric types for 10s (
   logs `instrument type conflict` or the gatherer an error, and `ContinueOnError` keeps the
   scrape at HTTP 200. `TestHistogramCollisionsKeepScrapesWorking` pins this.
 - Metric names must be valid OTel instrument names (start with a letter, then
-  `[A-Za-z0-9_.-/]`, up to 255 characters). Other names are logged and dropped.
+  `[A-Za-z0-9_.-/]`, up to 255 characters). Other names are dropped, counted as `invalid_name`.
+  `validInstrumentName` checks this before the SDK sees the name, because the SDK registers an
+  instrument in its cache before rejecting its name, which would let random invalid names pile
+  up. `TestValidInstrumentNameMatchesTheSDK` pins the two together.
+- Limits (`Limits`, `DefaultLimits`, `WithLimits`; flags `-max-metric-names`, `-max-tags`,
+  `-max-tag-key-len`, `-max-tag-value-len`, 0 disables a check) bound what a client can make the
+  server keep. Defaults: 1000 instruments, 20 tags, 64-byte keys, 200-byte values. An instrument
+  is a name and a type: `foo|c`, `foo|g` and `foo|h` take three, `|h` and `|ms` share one. The
+  `Aggregator` keeps the instruments it created (`instruments` in `limits.go`) and refuses new
+  ones at the limit, so existing names keep recording. A metric over a limit is dropped whole,
+  before it can take an instrument slot. Names starting with `quicmetrics.`, `quicmetrics_`,
+  `quicmetrics-` or `quicmetrics/` are reserved (`reserved_name`) so no client can collide with the
+  server's own metrics.
+- Every drop is counted in `quicmetrics_metrics_dropped_total{reason}` with the reason
+  `names`, `tags`, `tag_key_length`, `tag_value_length`, `reserved_name`, `invalid_name` or
+  `line_too_long` (one per session closed by the server, not per metric). It is an OTel counter
+  on the same meter, so it shares the registry and never needs a new dependency. Logs get one
+  `metrics dropped` warning per reason and minute (the first drop is logged right away) with that
+  `reason`, the drops since the last one and one example cut at 64 bytes (a metric name, or the
+  address and certificate subject of a client for `line_too_long`): never log a dropped metric
+  one by one, since the client chooses how many and what they say.
 - Tag keys need an ASCII letter or digit and must not start with `__`, otherwise the whole
-  metric is logged and dropped: the exporter can't turn such keys into label names.
+  metric is logged and dropped: the exporter can't turn such keys into label names. This one is
+  not a limit: it warns for every metric, like the other invalid input.
 
 ## Crash safety
 
@@ -177,6 +199,9 @@ One client must never take the server down.
   (about 9.2e18) wraps negative: the SDK adds whole-valued floats into an int64
   (`9e18|c` twice gives about -4.5e17). The per-value 2^63 bound can't prevent it. It is
   unreachable with realistic values, causes no crash and scrapes keep working.
+- Invalid lines, unsupported values and invalid tag keys are still logged at warn one by one,
+  with client-controlled text (quoted by `slog`). Only the drops for a limit are rate limited
+  and counted.
 - Each counter, gauge and histogram keeps at most 2000 tag sets (`NewPrometheusMeterProvider`).
   Beyond that, values go to a single `otel_metric_overflow="true"` series: a sum for a
   counter, the last overflowing value for a gauge, the merged observations for a histogram.
@@ -189,8 +214,11 @@ One client must never take the server down.
 - A histogram costs more than a counter. At the 2000 tag sets limit, measured with
   `BenchmarkRecordHistogramCardinality` and `BenchmarkRecordCardinality`, a histogram holds
   about 3.9 KB of heap per tag set (about 7.7 MB per name, and 18 lines per tag set on
-  `/metrics`) against about 1.6 KB for a counter (about 3.1 MB per name). Names are not
-  bounded, so a client can still multiply that by creating histograms with different names.
+  `/metrics`) against about 1.6 KB for a counter (about 3.1 MB per name). The names are bounded
+  by `-max-metric-names`, but the product is still large: 1000 histograms that each fill their
+  2000 tag sets hold about 7.7 GB, and more with long tags: those figures come from short ones,
+  and 20 tags of 64 and 200 bytes cost several KB more per tag set. Lower the limit of names where
+  memory is tight. There is no limit of series in all.
 - A gauge keeps its last value on `/metrics` forever after the client stops sending it: there
   is no staleness or expiry.
 - A client that completes the handshake and keeps sending packets (but no data) holds a session

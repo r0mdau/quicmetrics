@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
 	"github.com/r0mdau/quicmetrics/internal/protocol"
 	"github.com/r0mdau/quicmetrics/internal/tlstest"
@@ -407,8 +408,11 @@ func TestHandleConnClosesSessionOnLineTooLong(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	agg, reader := newTestAggregator()
-	srv, logs := newCapturingServer(agg)
+	var logs syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	reader := sdkmetric.NewManualReader()
+	agg := NewAggregator(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test"), logger)
+	srv := New(agg, logger)
 
 	listener := listenQUIC(t)
 	client := dialQUIC(ctx, t, listener)
@@ -425,16 +429,20 @@ func TestHandleConnClosesSessionOnLineTooLong(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	waitDone(t, done)
-	assertNoSessionPanic(t, logs)
+	assertNoSessionPanic(t, &logs)
 
 	_, err = stream.Read(make([]byte, 1))
 	if !errors.As(err, &appErr) || appErr.ErrorCode != protocol.CodeLineTooLong {
 		t.Errorf("read error = %v, want application error code %d", err, protocol.CodeLineTooLong)
 	}
-	if !strings.Contains(logs.String(), "level=WARN") {
+	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "reason=line_too_long") {
 		t.Errorf("oversized line was not logged as a warning:\n%s", logs.String())
 	}
 	assertValues(t, values(collectSums(t, reader)), map[string]float64{"foo{}": 1})
+	assertDropped(t, reader, map[string]int64{"line_too_long": 1})
+	if !strings.Contains(logs.String(), "example=127.0.0.1:") {
+		t.Errorf("the drop does not name the client:\n%s", logs.String())
+	}
 }
 
 func TestHandleConnAcknowledgesPipelinedBatchesInBulk(t *testing.T) {
