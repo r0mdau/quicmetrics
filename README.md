@@ -91,6 +91,10 @@ Server flags:
 | `-tls-key` | | PEM private key of the QUIC listener. Needs `-tls-cert` |
 | `-tls-client-ca` | | PEM bundle of the CAs that sign client certificates, reloaded when the file changes. When set, clients must present a valid certificate (mTLS) |
 | `-tls-reload-interval` | `30s` | How often `-tls-cert`, `-tls-key` and `-tls-client-ca` are checked for changes |
+| `-max-metric-names` | `1000` | Counters, gauges and histograms by name (`foo\|c` and `foo\|g` count twice), `0` for no limit |
+| `-max-tags` | `20` | Tags per metric, `0` for no limit |
+| `-max-tag-key-len` | `64` | Bytes in a tag key, `0` for no limit |
+| `-max-tag-value-len` | `200` | Bytes in a tag value, `0` for no limit |
 | `-log-level` | `info` | `debug` also logs every received metric |
 
 The server stops gracefully on `SIGINT` or `SIGTERM`.
@@ -101,6 +105,16 @@ stream and no unidirectional stream, per-stream and per-connection receive windo
 Retry round trip before the server keeps any handshake state for it, so spoofed addresses cost
 the server nothing. A client that stays silent for `-idle-timeout` is dropped, so a client sending
 less often than that needs a keep-alive.
+
+A metric over one of the limits above is dropped whole, and existing names keep recording once
+`-max-metric-names` is reached. Each drop is counted in
+`quicmetrics_metrics_dropped_total{reason="..."}` (`names`, `tags`, `tag_key_length`,
+`tag_value_length`, `invalid_name`, `reserved_name`, and `line_too_long` for each session closed because
+of a line over 8 KiB) on `/metrics`, and logged as one warning
+per reason and minute. Metric names starting with `quicmetrics.`, `quicmetrics_`, `quicmetrics-`
+or `quicmetrics/` are reserved for the server's own metrics. The limits bound the memory a client
+can use, but not to a small number: every name may still hold up to 2000 tag sets, which
+can reach gigabytes with 1000 histograms and long tags. Lower `-max-metric-names` where memory is tight.
 
 Client flags:
 

@@ -170,6 +170,10 @@ func TestRunFlags(t *testing.T) {
 		{"-tls-key", "tls.key"},
 		{"-tls-cert", "tls.crt", "-tls-key", "tls.key", "-tls-reload-interval", "0s"},
 		{"-tls-reload-interval", "-1s"},
+		{"-max-metric-names", "-1"},
+		{"-max-tags", "-1"},
+		{"-max-tag-key-len", "-1"},
+		{"-max-tag-value-len", "-1"},
 	} {
 		if err := run(context.Background(), args, io.Discard); !errors.Is(err, errUsage) {
 			t.Errorf("run %v = %v, want errUsage", args, err)
@@ -394,6 +398,71 @@ func TestRunRequiresClientCertificatesWithTLSClientCA(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), `client_subject="CN=agent-1"`) || strings.Contains(logs.String(), "agent-2") {
 		t.Errorf("want the accepted client's subject and no other logged:\n%s", logs.String())
+	}
+
+	cancel()
+	if err := <-errc; err != nil {
+		t.Errorf("run = %v, want nil after cancel", err)
+	}
+}
+
+func TestRunAppliesLimitFlags(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var logs syncBuffer
+	errc := make(chan error, 1)
+	go func() {
+		errc <- run(ctx, []string{
+			"-addr", "127.0.0.1:0", "-metrics-addr", "127.0.0.1:0",
+			"-max-metric-names", "1", "-max-tags", "2", "-max-tag-key-len", "3", "-max-tag-value-len", "4",
+		}, &logs)
+	}()
+	quicAddr := waitForAddr(t, &logs, quicAddrRe)
+	httpAddr := waitForAddr(t, &logs, httpAddrRe)
+
+	dialCtx, cancelDial := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelDial()
+	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{protocol.ALPN}, MinVersion: tls.VersionTLS13}
+	conn, err := quic.DialAddr(dialCtx, quicAddr, tlsConf, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.CloseWithError(0, "") }()
+	stream, err := conn.OpenStreamSync(dialCtx)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	sendMetrics(t, stream,
+		"limited.hits:1|c|#env:test",
+		"other.hits:1|c",
+		"limited.hits:1|c|#a:1,b:2,c:3",
+		"limited.hits:1|c|#toolong:1",
+		"limited.hits:1|c|#a:12345",
+	)
+
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Get("http://" + httpAddr + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	for _, want := range []string{
+		`limited_hits_total{env="test"} 1`,
+		`quicmetrics_metrics_dropped_total{reason="names"} 1`,
+		`quicmetrics_metrics_dropped_total{reason="tags"} 1`,
+		`quicmetrics_metrics_dropped_total{reason="tag_key_length"} 1`,
+		`quicmetrics_metrics_dropped_total{reason="tag_value_length"} 1`,
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("/metrics missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(string(body), "other_hits") {
+		t.Errorf("/metrics exposes a metric over -max-metric-names:\n%s", body)
 	}
 
 	cancel()

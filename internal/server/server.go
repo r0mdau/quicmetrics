@@ -112,11 +112,20 @@ func (s *Server) handleConn(ctx context.Context, conn *quic.Conn) {
 	err = s.serveStream(context.WithoutCancel(ctx), stream)
 	switch {
 	case errors.Is(err, errLineTooLong):
-		logger.Warn("closing session", "err", err)
 		closeCode, closeReason = protocol.CodeLineTooLong, "line too long"
+		logger.Debug("closing session", "err", err)
+		s.agg.lineTooLong(ctx, clientName(conn))
 	case err != nil && !isExpectedClose(ctx, err):
 		logger.Warn("session ended with error", "err", err)
 	}
+}
+
+func clientName(conn *quic.Conn) string {
+	name := conn.RemoteAddr().String()
+	if certs := conn.ConnectionState().TLS.PeerCertificates; len(certs) > 0 {
+		name += " " + certs[0].Subject.String()
+	}
+	return name
 }
 
 func isExpectedClose(ctx context.Context, err error) bool {
