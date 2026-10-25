@@ -55,7 +55,8 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	maxSessions := fs.Int("max-sessions", server.DefaultMaxSessions, "maximum number of concurrent QUIC sessions, others are rejected")
 	tlsCert := fs.String("tls-cert", "", "PEM certificate chain of the QUIC listener, reloaded when the file changes (with -tls-key)")
 	tlsKey := fs.String("tls-key", "", "PEM private key of the QUIC listener (with -tls-cert)")
-	tlsReload := fs.Duration("tls-reload-interval", defaultTLSReloadInterval, "how often -tls-cert and -tls-key are checked for changes")
+	tlsClientCA := fs.String("tls-client-ca", "", "PEM bundle of the CAs that sign client certificates, reloaded when the file changes: when set, clients must present a valid certificate (mTLS)")
+	tlsReload := fs.Duration("tls-reload-interval", defaultTLSReloadInterval, "how often -tls-cert, -tls-key and -tls-client-ca are checked for changes")
 	var level slog.Level
 	fs.TextVar(&level, "log-level", slog.LevelInfo, "minimum log level: debug, info, warn or error")
 	if err := fs.Parse(args); err != nil {
@@ -113,6 +114,14 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 			return fmt.Errorf("create TLS config: %w", err)
 		}
 	}
+	var clientCAs *server.CAReloader
+	if *tlsClientCA != "" {
+		clientCAs, err = server.NewCAReloader(*tlsClientCA, logger)
+		if err != nil {
+			return fmt.Errorf("create TLS config: %w", err)
+		}
+		clientCAs.RequireClientCerts(tlsConf)
+	}
 	listener, err := server.Listen(*addr, tlsConf, quicConf)
 	if err != nil {
 		return fmt.Errorf("listen QUIC on %s: %w", *addr, err)
@@ -146,6 +155,9 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	})
 	if certs != nil {
 		wg.Go(func() { certs.Watch(ctx, *tlsReload) })
+	}
+	if clientCAs != nil {
+		wg.Go(func() { clientCAs.Watch(ctx, *tlsReload) })
 	}
 	wg.Go(func() {
 		logger.Info("serving Prometheus metrics", "addr", httpListener.Addr().String(), "path", "/metrics")

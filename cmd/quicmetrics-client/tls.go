@@ -12,6 +12,8 @@ import (
 // tlsOptions holds the TLS flags of the client.
 type tlsOptions struct {
 	caFile     string
+	certFile   string
+	keyFile    string
 	serverName string
 	insecure   bool
 }
@@ -21,10 +23,20 @@ func (o tlsOptions) tlsConfig() (*tls.Config, error) {
 	if o.insecure && o.caFile != "" {
 		return nil, fmt.Errorf("%w: -insecure and -tls-ca are mutually exclusive", errUsage)
 	}
+	if (o.certFile == "") != (o.keyFile == "") {
+		return nil, fmt.Errorf("%w: -tls-cert and -tls-key must be set together", errUsage)
+	}
 	conf := &tls.Config{
 		ServerName: o.serverName,
 		NextProtos: []string{protocol.ALPN},
 		MinVersion: tls.VersionTLS13,
+	}
+	if o.certFile != "" {
+		cert, err := tls.LoadX509KeyPair(o.certFile, o.keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("load -tls-cert and -tls-key: %w", err)
+		}
+		conf.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &cert, nil }
 	}
 	if o.insecure {
 		conf.InsecureSkipVerify = true //nolint:gosec // explicit opt-in with -insecure
