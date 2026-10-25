@@ -23,20 +23,21 @@ Libraries used:
 | --- | --- |
 | `cmd/quicmetrics` | Server command: flags, wiring, graceful shutdown |
 | `cmd/quicmetrics-client` | Client that generates realistic counters, gauges and histograms |
-| `internal/server` | QUIC sessions, DogStatsD parsing, OpenTelemetry aggregation, TLS |
+| `internal/server` | QUIC listener and sessions, DogStatsD parsing, OpenTelemetry aggregation, TLS |
 | `internal/protocol` | ALPN and default address shared by server and client |
 
 ## Wire protocol
 
 A client opens a QUIC connection with the ALPN from `internal/protocol` and one
-bidirectional stream. A stream is a byte stream, so metrics are newline-delimited
+bidirectional stream (the server allows no second stream and no unidirectional stream). A
+stream is a byte stream, so metrics are newline-delimited
 [DogStatsD](https://docs.datadoghq.com/developers/dogstatsd/datagram_shapes/) lines:
 
 - a line ends with `\n`. A trailing `\r` is dropped, empty lines are skipped and a last line
   without `\n` is processed when the client closes its side of the stream. Several metrics can
   share one write and one metric can span several writes.
 - a line is at most 8192 bytes (`server.MaxLineLength`) without its terminator. A longer line
-  closes the session with QUIC application error code 1.
+  closes the session with application error code 1 (see below).
 - the server never echoes metrics. It acknowledges them in bulk: after it has processed every
   complete line it has read, and before it waits for more bytes, it writes one line holding the
   number of non-empty lines it has processed on the stream so far, in decimal (`1000\n`). A
@@ -51,6 +52,15 @@ bidirectional stream. A stream is a byte stream, so metrics are newline-delimite
 - a client must read its last ack before it closes the stream or connection: an ack written
   just before the session closes may be lost, and so may the acks for lines processed just
   before a `line too long` close. The metrics are recorded either way.
+
+The server closes a connection with one of these QUIC application error codes (defined in
+`internal/protocol/errors.go`), and the close reason says why:
+
+| Code | Name | Meaning |
+| --- | --- | --- |
+| 0 | `CodeNoError` | Normal close: the client is done, or the server is shutting down |
+| 1 | `CodeLineTooLong` | A line exceeds 8192 bytes (reason `line too long`) |
+| 2 | `CodeServerBusy` | The server already serves `-max-sessions` sessions (reason `too many sessions`) |
 
 ## Getting started
 
@@ -72,9 +82,18 @@ Server flags:
 | --- | --- | --- |
 | `-addr` | `localhost:4242` | UDP address of the QUIC listener |
 | `-metrics-addr` | `:2223` | TCP address of the Prometheus `/metrics` endpoint |
+| `-idle-timeout` | `30s` | A session without traffic for this long is closed |
+| `-max-sessions` | `1000` | Concurrent QUIC sessions, further connections are closed with application error code 2 (`too many sessions`) |
 | `-log-level` | `info` | `debug` also logs every received metric |
 
 The server stops gracefully on `SIGINT` or `SIGTERM`.
+
+The listener is hardened against misbehaving peers: a connection may open one bidirectional
+stream and no unidirectional stream, per-stream and per-connection receive windows are small
+(256 KiB and 512 KiB at most), and every client proves it owns its source address with a QUIC
+Retry round trip before the server keeps any handshake state for it, so spoofed addresses cost
+the server nothing. A client that stays silent for `-idle-timeout` is dropped, so a client sending
+less often than that needs a keep-alive.
 
 Client flags:
 

@@ -164,3 +164,19 @@ func TestRunFlags(t *testing.T) {
 		}
 	}
 }
+
+func TestRunRejectsInvalidQUICLimits(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ flag, value string }{
+		{"-max-sessions", "0"},
+		{"-max-sessions", "-3"},
+		{"-idle-timeout", "0s"},
+		{"-idle-timeout", "-1s"},
+	} {
+		args := []string{tc.flag, tc.value}
+		err := run(context.Background(), append([]string{"-addr", "127.0.0.1:0", "-metrics-addr", "127.0.0.1:0"}, args...), io.Discard)
+		if err == nil || errors.Is(err, errUsage) || !strings.Contains(err.Error(), tc.flag) {
+			t.Errorf("run %v = %v, want a validation error naming %s", args, err, tc.flag)
+		}
+	}
+}
