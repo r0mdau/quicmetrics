@@ -33,6 +33,11 @@ func TestSelfSignedTLSConfig(t *testing.T) {
 	if _, ok := cert.PublicKey.(*ecdsa.PublicKey); !ok {
 		t.Errorf("public key is %T, want *ecdsa.PublicKey", cert.PublicKey)
 	}
+	for _, host := range []string{"localhost", "127.0.0.1", "::1"} {
+		if err := cert.VerifyHostname(host); err != nil {
+			t.Errorf("VerifyHostname(%q): %v", host, err)
+		}
+	}
 	if now := time.Now(); now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
 		t.Errorf("certificate not valid now: %v to %v", cert.NotBefore, cert.NotAfter)
 	}

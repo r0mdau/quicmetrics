@@ -9,13 +9,15 @@ import (
 	"crypto/x509/pkix"
 	"fmt"
 	"math/big"
+	"net"
 	"time"
 
 	"github.com/r0mdau/quicmetrics/internal/protocol"
 )
 
 // SelfSignedTLSConfig returns a server TLS config with a fresh self-signed ECDSA P-256
-// certificate valid for one year, TLS 1.3 only, and the quicmetrics ALPN.
+// certificate for localhost, 127.0.0.1 and ::1, valid for one year, TLS 1.3 only, and the
+// quicmetrics ALPN.
 func SelfSignedTLSConfig() (*tls.Config, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -29,6 +31,8 @@ func SelfSignedTLSConfig() (*tls.Config, error) {
 	template := x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: "quicmetrics"},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
 		NotBefore:    now.Add(-time.Hour),
 		NotAfter:     now.Add(365 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
