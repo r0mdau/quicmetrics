@@ -7,7 +7,7 @@
 | Path | Role |
 | --- | --- |
 | `cmd/quicmetrics` | Server command: flags, wiring, `run(ctx, args, stderr) error` |
-| `cmd/quicmetrics-client` | Client that generates realistic counters, gauges and histograms (`generator.go`) |
+| `cmd/quicmetrics-client` | Client that generates realistic counters, gauges and histograms (`generator.go`) and pipelines them in batches |
 | `internal/server` | `Server` (QUIC sessions), `Aggregator` (counters, gauges, histograms) + `Parse`, `SelfSignedTLSConfig` |
 | `internal/protocol` | `ALPN` and `DefaultAddr`, shared by both commands |
 
@@ -47,10 +47,19 @@ go run ./cmd/quicmetrics-client     # generate all metric types for 10s (see -h 
   closes the session with QUIC application error code 1 (`line too long`) and a warning,
   rather than dropping it, because the client is broken and the server would have to discard
   an unbounded stream to resynchronise. Lines acknowledged before that stay recorded.
-- The server echoes every non-empty line back, terminated by `\n`, as an ack. Invalid lines
-  are acked too. The client sends one line and waits for its ack before the next. An ack
-  written just before the session closes (client FIN, then connection close) may be lost,
-  so a client must read its acks before closing.
+- **Acks are cumulative counts, the server never echoes metrics.** After it has processed every
+  complete line it has read, and before it blocks for more bytes, the server writes the number
+  of non-empty lines processed on the stream so far, in ASCII decimal, terminated by `\n`
+  (`1000\n`). The count includes lines that were invalid, ignored or dropped, never empty
+  lines, nor an incomplete line until the client closes its side of the stream. Acks are
+  strictly increasing, at most one per read chunk, and none is written when nothing new was
+  processed. A client can write any number of lines without waiting: ack `N` means the first
+  `N` non-empty lines it wrote are processed, so `sent - N` are in flight. The client keeps at
+  most `windowBatches` (4) times `-batch` metrics in flight.
+- An ack written just before the session closes (client FIN, then connection close) may be
+  lost, and so may the ack for lines processed just before a `line too long` close. A client
+  must read its last ack before it closes. The client does: once it stops sending, it waits up
+  to 5 seconds for the missing acks and then fails.
 - Only counters (`|c`), gauges (`|g`), histograms (`|h`) and timers (`|ms`) are recorded, with
   tags as attributes. Invalid lines are logged as warnings, and other metric types (sets
   `|s`, ...) at debug level. Both are acked, but not recorded.

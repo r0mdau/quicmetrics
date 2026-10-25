@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -103,29 +105,86 @@ func waitDone(t *testing.T, done <-chan struct{}) {
 	}
 }
 
-func ackOnce(stream *quic.Stream, msg string) error {
-	if _, err := stream.Write([]byte(msg + "\n")); err != nil {
-		return fmt.Errorf("write %q: %w", msg, err)
-	}
-	return readAck(stream, msg)
+type testClient struct {
+	stream *quic.Stream
+	acks   *bufio.Reader
+	sent   uint64
+	acked  uint64
 }
 
-func readAck(r io.Reader, want string) error {
-	ack := make([]byte, len(want)+1)
-	if _, err := io.ReadFull(r, ack); err != nil {
-		return fmt.Errorf("read ack of %q: %w", want, err)
+func newTestClient(stream *quic.Stream) *testClient {
+	return &testClient{stream: stream, acks: bufio.NewReader(stream)}
+}
+
+func (c *testClient) write(lines ...string) error {
+	if _, err := c.stream.Write([]byte(strings.Join(lines, "\n") + "\n")); err != nil {
+		return fmt.Errorf("write %q: %w", lines, err)
 	}
-	if string(ack) != want+"\n" {
-		return fmt.Errorf("ack = %q, want %q", ack, want+"\n")
+	c.sent += uint64(len(lines))
+	return nil
+}
+
+func (c *testClient) writeRaw(data string, lines uint64) error {
+	if _, err := c.stream.Write([]byte(data)); err != nil {
+		return fmt.Errorf("write %q: %w", data, err)
+	}
+	c.sent += lines
+	return nil
+}
+
+func (c *testClient) waitAcked() error {
+	for c.acked < c.sent {
+		if err := c.readOneAck(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func sendAndExpectAck(t *testing.T, stream *quic.Stream, msg string) {
+func (c *testClient) readOneAck() error {
+	line, err := c.acks.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read ack (%d of %d processed): %w", c.acked, c.sent, err)
+	}
+	n, err := strconv.ParseUint(strings.TrimSuffix(line, "\n"), 10, 64)
+	if err != nil || n <= c.acked || n > c.sent {
+		return fmt.Errorf("ack %q, want a count in (%d, %d]", line, c.acked, c.sent)
+	}
+	c.acked = n
+	return nil
+}
+
+func (c *testClient) ackOnce(msg string) error {
+	if err := c.write(msg); err != nil {
+		return err
+	}
+	return c.waitAcked()
+}
+
+func sendAndExpectAck(t *testing.T, c *testClient, msg string) {
 	t.Helper()
-	if err := ackOnce(stream, msg); err != nil {
+	if err := c.ackOnce(msg); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func parseAcks(t *testing.T, out string) []uint64 {
+	t.Helper()
+	var acks []uint64
+	for line := range strings.SplitSeq(strings.TrimSuffix(out, "\n"), "\n") {
+		if line == "" && out == "" {
+			break
+		}
+		n, err := strconv.ParseUint(line, 10, 64)
+		if err != nil {
+			t.Fatalf("ack %q in %q: %v", line, out, err)
+		}
+		if len(acks) > 0 && n <= acks[len(acks)-1] {
+			t.Fatalf("acks %q are not strictly increasing", out)
+		}
+		acks = append(acks, n)
+	}
+	return acks
 }
 
 func serveBytes(t *testing.T, srv *Server, in io.Reader) (acks string, err error) {
@@ -141,22 +200,21 @@ func serveBytes(t *testing.T, srv *Server, in io.Reader) (acks string, err error
 func TestServeStreamSplitsLines(t *testing.T) {
 	t.Parallel()
 	for _, tt := range []struct {
-		name string
-		in   string
-		acks string
-		want map[string]float64
+		name     string
+		in       string
+		lines    uint64
+		bulkAcks int
+		want     map[string]float64
 	}{
-		{"one line", "foo:1|c\n", "foo:1|c\n", map[string]float64{"foo{}": 1}},
-		{"several lines", "foo:1|c\nfoo:2|c|#a:x\nfoo:3|c|#a:x\n", "foo:1|c\nfoo:2|c|#a:x\nfoo:3|c|#a:x\n", map[string]float64{"foo{}": 1, "foo{a=x}": 5}},
-		{"CRLF", "foo:1|c\r\nfoo:2|c\r\n", "foo:1|c\nfoo:2|c\n", map[string]float64{"foo{}": 3}},
-		{"empty lines", "\n\r\nfoo:1|c\n\n\n", "foo:1|c\n", map[string]float64{"foo{}": 1}},
-		{"last line without terminator", "foo:1|c\nfoo:2|c", "foo:1|c\nfoo:2|c\n", map[string]float64{"foo{}": 3}},
-		{"carriage return inside a line is kept", "foo:1|c\rbar\n", "foo:1|c\rbar\n", nil},
-		{"invalid lines are acknowledged", "not a metric\nfoo:1|c|\nusers.unique:alice|s\nfoo:1|g|\nfoo:1|c||#a:b\nfoo:1|c|#a:b|\nfoo:1|c|@0.5|\nfoo\xff:1|c\n",
-			"not a metric\nfoo:1|c|\nusers.unique:alice|s\nfoo:1|g|\nfoo:1|c||#a:b\nfoo:1|c|#a:b|\nfoo:1|c|@0.5|\nfoo\xff:1|c\n", nil},
-		{"all metric types", "users.online:1|c|#country:france\ntemperature:21.5|g\nlatency:12|h\nlatency:12|ms\n",
-			"users.online:1|c|#country:france\ntemperature:21.5|g\nlatency:12|h\nlatency:12|ms\n", map[string]float64{"users.online{country=france}": 1}},
-		{"empty stream", "", "", nil},
+		{"one line", "foo:1|c\n", 1, 1, map[string]float64{"foo{}": 1}},
+		{"several lines", "foo:1|c\nfoo:2|c|#a:x\nfoo:3|c|#a:x\n", 3, 1, map[string]float64{"foo{}": 1, "foo{a=x}": 5}},
+		{"CRLF", "foo:1|c\r\nfoo:2|c\r\n", 2, 1, map[string]float64{"foo{}": 3}},
+		{"empty lines", "\n\r\nfoo:1|c\n\n\n", 1, 1, map[string]float64{"foo{}": 1}},
+		{"last line without terminator", "foo:1|c\nfoo:2|c", 2, 2, map[string]float64{"foo{}": 3}},
+		{"carriage return inside a line is kept", "foo:1|c\rbar\n", 1, 1, nil},
+		{"invalid lines are acknowledged", "not a metric\nfoo:1|c|\nusers.unique:alice|s\nfoo:1|g|\nfoo:1|c||#a:b\nfoo:1|c|#a:b|\nfoo:1|c|@0.5|\nfoo\xff:1|c\n", 8, 1, nil},
+		{"all metric types", "users.online:1|c|#country:france\ntemperature:21.5|g\nlatency:12|h\nlatency:12|ms\n", 4, 1, map[string]float64{"users.online{country=france}": 1}},
+		{"empty stream", "", 0, 0, nil},
 	} {
 		for _, oneByte := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/oneByte=%t", tt.name, oneByte), func(t *testing.T) {
@@ -170,8 +228,13 @@ func TestServeStreamSplitsLines(t *testing.T) {
 				if err != nil {
 					t.Fatalf("serveStream: %v", err)
 				}
-				if acks != tt.acks {
-					t.Errorf("acks = %q, want %q", acks, tt.acks)
+				got := parseAcks(t, acks)
+				wantAcks := uint64(tt.bulkAcks)
+				if oneByte {
+					wantAcks = tt.lines
+				}
+				if uint64(len(got)) != wantAcks || (tt.lines > 0 && got[len(got)-1] != tt.lines) {
+					t.Errorf("acks = %v, want %d acks ending at %d", got, wantAcks, tt.lines)
 				}
 				assertValues(t, values(collectSums(t, reader)), tt.want)
 			})
@@ -186,7 +249,7 @@ func TestServeStreamLineLimit(t *testing.T) {
 		name    string
 		in      string
 		wantErr bool
-		acks    int
+		lines   uint64
 	}{
 		{"max length", line(MaxLineLength) + "\n", false, 1},
 		{"max length with CRLF", line(MaxLineLength) + "\r\n", false, 1},
@@ -205,8 +268,12 @@ func TestServeStreamLineLimit(t *testing.T) {
 			if errors.Is(err, errLineTooLong) != tt.wantErr || (err != nil) != tt.wantErr {
 				t.Fatalf("err = %v, want line too long: %t", err, tt.wantErr)
 			}
-			if got := strings.Count(acks, "\n"); got != tt.acks {
-				t.Errorf("%d acks, want %d", got, tt.acks)
+			var last uint64
+			if got := parseAcks(t, acks); len(got) > 0 {
+				last = got[len(got)-1]
+			}
+			if last != tt.lines {
+				t.Errorf("last ack = %d, want %d", last, tt.lines)
 			}
 		})
 	}
@@ -239,7 +306,7 @@ func TestServeStreamPropagatesReadError(t *testing.T) {
 	if !errors.Is(err, want) {
 		t.Fatalf("err = %v, want %v", err, want)
 	}
-	if acks != "foo:1|c\n" {
+	if acks != "1\n" {
 		t.Errorf("acks = %q, want only the complete line", acks)
 	}
 }
@@ -277,8 +344,9 @@ func TestHandleConnAcknowledgesAndAggregatesOverQUIC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open stream: %v", err)
 	}
+	c := newTestClient(stream)
 	for _, msg := range []string{"foo:1|c|", "foo:2|c|#a:x"} {
-		sendAndExpectAck(t, stream, msg)
+		sendAndExpectAck(t, c, msg)
 	}
 	if err := stream.Close(); err != nil {
 		t.Fatalf("close stream: %v", err)
@@ -304,25 +372,25 @@ func TestHandleConnFramesLinesOverQUIC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open stream: %v", err)
 	}
-	if _, err := stream.Write([]byte("foo:1|c\nfoo:2|c|#a:x\nfoo:3|c")); err != nil {
-		t.Fatalf("write: %v", err)
+	c := newTestClient(stream)
+	steps := []struct {
+		data  string
+		lines uint64
+	}{
+		{"foo:1|c\nfoo:2|c|#a:x\nfoo:3|c", 2},
+		{"|#a", 0},
+		{":x,b:", 0},
+		{"y", 0},
+		{"\r\n\n", 1},
 	}
-	for _, want := range []string{"foo:1|c", "foo:2|c|#a:x"} {
-		if err := readAck(stream, want); err != nil {
+	for _, step := range steps {
+		if err := c.writeRaw(step.data, step.lines); err != nil {
 			t.Fatal(err)
 		}
-	}
-	for _, part := range []string{"|#a", ":x,b:", "y"} {
-		if _, err := stream.Write([]byte(part)); err != nil {
-			t.Fatalf("write: %v", err)
+		if err := c.waitAcked(); err != nil {
+			t.Fatal(err)
 		}
 		time.Sleep(20 * time.Millisecond)
-	}
-	if _, err := stream.Write([]byte("\r\n\n")); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	if err := readAck(stream, "foo:3|c|#a:x,b:y"); err != nil {
-		t.Fatal(err)
 	}
 	if err := stream.Close(); err != nil {
 		t.Fatalf("close stream: %v", err)
@@ -348,7 +416,7 @@ func TestHandleConnClosesSessionOnLineTooLong(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open stream: %v", err)
 	}
-	sendAndExpectAck(t, stream, "foo:1|c")
+	sendAndExpectAck(t, newTestClient(stream), "foo:1|c")
 	var appErr *quic.ApplicationError
 	_, err = stream.Write([]byte(strings.Repeat("x", 2*MaxLineLength)))
 	if err != nil && (!errors.As(err, &appErr) || appErr.ErrorCode != errCodeLineTooLong) {
@@ -367,6 +435,55 @@ func TestHandleConnClosesSessionOnLineTooLong(t *testing.T) {
 	assertValues(t, values(collectSums(t, reader)), map[string]float64{"foo{}": 1})
 }
 
+func TestHandleConnAcknowledgesPipelinedBatchesInBulk(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	agg, reader := newTestAggregator()
+	srv, logs := newCapturingServer(agg)
+
+	listener := listenQUIC(t)
+	client := dialQUIC(ctx, t, listener)
+	done := runHandleConn(ctx, t, srv, listener)
+
+	stream, err := client.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	c := newTestClient(stream)
+	const batches, perBatch = 20, 500
+	for range batches {
+		batch := make([]string, perBatch)
+		for i := range batch {
+			batch[i] = "foo:1|c|#a:x"
+		}
+		if err := c.write(batch...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var acks int
+	for c.acked < c.sent {
+		before := c.acked
+		if err := c.readOneAck(); err != nil {
+			t.Fatal(err)
+		}
+		acks++
+		if c.acked <= before {
+			t.Fatalf("ack went from %d to %d", before, c.acked)
+		}
+	}
+	if acks >= batches*perBatch/10 {
+		t.Errorf("%d acks for %d lines, want far fewer than one per line", acks, batches*perBatch)
+	}
+	if err := client.CloseWithError(0, "done"); err != nil {
+		t.Fatalf("client close: %v", err)
+	}
+	waitDone(t, done)
+	assertNoSessionPanic(t, logs)
+
+	assertValues(t, values(collectSums(t, reader)), map[string]float64{"foo{a=x}": batches * perBatch})
+}
+
 func TestHandleConnTreatsClientCloseAsClean(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
@@ -382,7 +499,7 @@ func TestHandleConnTreatsClientCloseAsClean(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open stream: %v", err)
 	}
-	sendAndExpectAck(t, stream, "foo:1|c")
+	sendAndExpectAck(t, newTestClient(stream), "foo:1|c")
 	if err := client.CloseWithError(0, "done"); err != nil {
 		t.Fatalf("client close: %v", err)
 	}
@@ -431,7 +548,7 @@ func TestServeClosesSessionsWhenContextCancelled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open stream: %v", err)
 	}
-	sendAndExpectAck(t, stream, "foo:1|c")
+	sendAndExpectAck(t, newTestClient(stream), "foo:1|c")
 
 	stopServe()
 	select {
@@ -463,37 +580,55 @@ func serveQUIC(ctx context.Context, tb testing.TB, srv *Server) *quic.Listener {
 	return listener
 }
 
-// BenchmarkSessionsParallel sends generated counters from several QUIC connections at once,
-// each waiting for its ack before the next write like the real client.
+// BenchmarkSessionsParallel pipelines batches of generated counters from several QUIC connections.
 func BenchmarkSessionsParallel(b *testing.B) {
+	const benchBatch, benchWindow = 100, 4
 	lines := benchLines(b, 1024)
 	for _, conns := range []int{1, 4, 16} {
 		b.Run(fmt.Sprintf("conns_%d", conns), func(b *testing.B) {
 			ctx := b.Context()
 			agg, reader := newTestAggregator()
 			listener := serveQUIC(ctx, b, New(agg, discardLogger))
-			streams := make([]*quic.Stream, conns)
-			for i := range streams {
+			clients := make([]*testClient, conns)
+			for i := range clients {
 				stream, err := dialQUIC(ctx, b, listener).OpenStreamSync(ctx)
 				if err != nil {
 					b.Fatalf("open stream: %v", err)
 				}
-				if err := ackOnce(stream, lines[0]); err != nil {
+				clients[i] = newTestClient(stream)
+				if err := clients[i].ackOnce(lines[0]); err != nil {
 					b.Fatal(err)
 				}
-				streams[i] = stream
 			}
 
 			var next atomic.Int64
 			var wg sync.WaitGroup
 			b.ResetTimer()
-			for _, stream := range streams {
+			for _, c := range clients {
 				wg.Go(func() {
-					for i := next.Add(1); i <= int64(b.N); i = next.Add(1) {
-						if err := ackOnce(stream, lines[int(i)%len(lines)]); err != nil {
+					batch := make([]string, 0, benchBatch)
+					for {
+						start := int(next.Add(benchBatch)) - benchBatch
+						if start >= b.N {
+							break
+						}
+						batch = batch[:0]
+						for i := start; i < min(start+benchBatch, b.N); i++ {
+							batch = append(batch, lines[i%len(lines)])
+						}
+						if err := c.write(batch...); err != nil {
 							b.Error(err)
 							return
 						}
+						for c.sent-c.acked > benchWindow*benchBatch {
+							if err := c.readOneAck(); err != nil {
+								b.Error(err)
+								return
+							}
+						}
+					}
+					if err := c.waitAcked(); err != nil {
+						b.Error(err)
 					}
 				})
 			}

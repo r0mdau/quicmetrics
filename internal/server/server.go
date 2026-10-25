@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"runtime/debug"
+	"strconv"
 	"sync"
 
 	"github.com/quic-go/quic-go"
@@ -25,7 +26,7 @@ var errLineTooLong = fmt.Errorf("line longer than %d bytes", MaxLineLength)
 
 // Server accepts QUIC connections and feeds every received metric to an Aggregator.
 //
-// Each connection carries one stream of newline-delimited metrics.
+// Each connection carries one stream of newline-delimited metrics, acknowledged in bulk.
 type Server struct {
 	agg      *Aggregator
 	logger   *slog.Logger
@@ -96,7 +97,19 @@ func isExpectedClose(ctx context.Context, err error) bool {
 
 func (s *Server) serveStream(ctx context.Context, rw io.ReadWriter) error {
 	r := bufio.NewReaderSize(rw, MaxLineLength+2)
+	var processed, acked uint64
 	var ack []byte
+	flush := func() error {
+		if processed == acked {
+			return nil
+		}
+		ack = append(strconv.AppendUint(ack[:0], processed, 10), '\n')
+		if _, err := rw.Write(ack); err != nil {
+			return fmt.Errorf("write ack: %w", err)
+		}
+		acked = processed
+		return nil
+	}
 	for {
 		line, err := r.ReadSlice('\n')
 		if errors.Is(err, bufio.ErrBufferFull) {
@@ -112,13 +125,20 @@ func (s *Server) serveStream(ctx context.Context, rw io.ReadWriter) error {
 		}
 		if len(line) > 0 {
 			s.agg.Record(ctx, string(line))
-			ack = append(append(ack[:0], line...), '\n')
-			if _, err := rw.Write(ack); err != nil {
-				return fmt.Errorf("write ack: %w", err)
+			processed++
+		}
+		if eof || !hasBufferedLine(r) {
+			if err := flush(); err != nil {
+				return err
 			}
 		}
 		if eof {
 			return nil
 		}
 	}
+}
+
+func hasBufferedLine(r *bufio.Reader) bool {
+	buffered, _ := r.Peek(r.Buffered())
+	return bytes.IndexByte(buffered, '\n') >= 0
 }

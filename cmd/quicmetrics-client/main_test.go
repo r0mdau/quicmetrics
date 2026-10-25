@@ -51,6 +51,101 @@ func TestSendMetricsDeliversGeneratedMetrics(t *testing.T) {
 	}
 }
 
+func TestSendMetricsDeliversBatches(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name string
+		opts options
+	}{
+		{"unpaced", options{count: 1000, batch: 50}},
+		{"unpaced, count not a multiple of the batch", options{count: 1001, batch: 64}},
+		{"unpaced, batch larger than count", options{count: 7, batch: 100}},
+		{"paced", options{count: 600, batch: 25, interval: 100 * time.Microsecond}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			addr, reader := startServer(ctx, t)
+
+			const seed, functions = 5, 4
+			acked, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, newGenerator(seed, functions), tt.opts)
+			if err != nil {
+				t.Fatalf("sendMetrics: %v", err)
+			}
+			if acked != tt.opts.count {
+				t.Fatalf("acknowledged %d metrics, want %d", acked, tt.opts.count)
+			}
+
+			wantReader := sdkmetric.NewManualReader()
+			wantAgg := server.NewAggregator(sdkmetric.NewMeterProvider(sdkmetric.WithReader(wantReader)).Meter("test"), slog.New(slog.DiscardHandler))
+			gen := newGenerator(seed, functions)
+			for range tt.opts.count {
+				wantAgg.Record(ctx, gen.next())
+			}
+			if got, want := collectValues(t, reader), collectValues(t, wantReader); !maps.Equal(got, want) {
+				t.Fatalf("got %v\nwant %v", got, want)
+			}
+		})
+	}
+}
+
+func TestSendMetricsLogsEverySentMetricAtDebug(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	addr, _ := startServer(ctx, t)
+
+	var logs strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	if _, err := sendMetrics(ctx, logger, addr, newGenerator(1, 1), options{count: 30, batch: 10}); err != nil {
+		t.Fatalf("sendMetrics: %v", err)
+	}
+	if got := strings.Count(logs.String(), `msg="metric sent"`); got != 30 {
+		t.Errorf("logged %d sent metrics, want 30", got)
+	}
+	if !strings.Contains(logs.String(), "count=30") {
+		t.Errorf("missing the final count in the logs:\n%s", logs.String())
+	}
+}
+
+func TestSendMetricsRejectsInvalidAcks(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name string
+		ack  string
+	}{
+		{"more than sent", "5000\n"},
+		{"zero", "0\n"},
+		{"negative", "-1\n"},
+		{"not a number", "ok\n"},
+		{"echoed metric", "foo:1|c\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			addr := startAckServer(ctx, t, tt.ack)
+
+			_, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, newGenerator(1, 1), options{count: 3, batch: 3})
+			if err == nil {
+				t.Fatal("sendMetrics accepted an invalid ack")
+			}
+		})
+	}
+}
+
+func TestSendMetricsFailsWhenServerCloses(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	addr := startAckServer(ctx, t, "")
+
+	if _, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, newGenerator(1, 1), options{count: 3, batch: 3}); err == nil {
+		t.Fatal("sendMetrics returned nil although the server closed the session without acks")
+	}
+}
+
 func TestSendMetricsStopsAfterDuration(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -129,6 +224,8 @@ func TestRunRejectsInvalidFlags(t *testing.T) {
 		{"-rate", "2e9"},
 		{"-rate", "1e-12"},
 		{"-count", "-1"},
+		{"-batch", "0"},
+		{"-batch", "10001"},
 		{"-duration", "-1s"},
 		{"-functions", "0"},
 		{"-functions", "11"},
@@ -161,6 +258,41 @@ func TestRunCanceledWhileConnectingIsNotAnError(t *testing.T) {
 	if err := run(ctx, []string{"-addr", "127.0.0.1:1"}, io.Discard); err != nil {
 		t.Fatalf("run = %v, want nil", err)
 	}
+}
+
+func startAckServer(ctx context.Context, t *testing.T, ack string) (addr string) {
+	t.Helper()
+	tlsConf, err := server.SelfSignedTLSConfig()
+	if err != nil {
+		t.Fatalf("TLS config: %v", err)
+	}
+	listener, err := quic.ListenAddr("127.0.0.1:0", tlsConf, nil)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := listener.Accept(ctx)
+		if err != nil {
+			return
+		}
+		stream, err := conn.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		_, _ = stream.Read(make([]byte, 4096))
+		if ack != "" {
+			_, _ = stream.Write([]byte(ack))
+			time.Sleep(100 * time.Millisecond)
+		}
+		_ = conn.CloseWithError(0, "bye")
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		<-done
+	})
+	return listener.Addr().String()
 }
 
 func startServer(ctx context.Context, t *testing.T) (addr string, reader *sdkmetric.ManualReader) {
