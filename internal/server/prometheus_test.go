@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -464,5 +465,52 @@ func BenchmarkRecordWhileScraping(b *testing.B) {
 				b.Fatalf("series = %d, want %d", count, series)
 			}
 		})
+	}
+}
+
+func TestSeriesTTLExposesTheSameMetricsAsWithoutIt(t *testing.T) {
+	t.Parallel()
+	plain, plainRegistry := newPrometheusAggregator(t)
+	env := newExpiryEnv(t, testTTL, DefaultLimits())
+	batches := [][]string{
+		{"hits:1|c|#route:a", "hits:2.5|c|#route:b", "temp:21.5|g|#room:a", "lat:3|h|#route:a", "lat:30|ms|#route:a"},
+		{"hits:4|c|#route:a", "temp:-3|g|#room:a", "temp:1|g|#room:b", "lat:5000|h|#route:a", "lat:5|h", "idle:1|c"},
+		{},
+		{"hits:1|c|@0.5", "lat:20000|h|#route:b", "x.y-z/w:7|c|#a_b:c"},
+	}
+	for i, batch := range batches {
+		for _, line := range batch {
+			plain.Record(context.Background(), line)
+			env.record(line)
+		}
+		env.clock.Advance(time.Minute)
+		if got, want := env.scrape(t), scrape(t, plainRegistry); got != want {
+			t.Fatalf("after batch %d /metrics differs:\n--- with TTL\n%s\n--- without\n%s", i, got, want)
+		}
+	}
+}
+
+func TestSeriesTTLOfZeroKeepsTheSDKProvider(t *testing.T) {
+	t.Parallel()
+	provider, err := NewPrometheusMeterProvider(prometheus.NewRegistry(), WithSeriesTTL(0))
+	if err != nil {
+		t.Fatalf("NewPrometheusMeterProvider: %v", err)
+	}
+	if provider.exporter != nil {
+		t.Error("a TTL of 0 hosts the exporter in a second provider, want the plain SDK provider")
+	}
+	if err := provider.Shutdown(context.Background()); err != nil {
+		t.Errorf("Shutdown: %v", err)
+	}
+}
+
+func TestPipelineShutdown(t *testing.T) {
+	t.Parallel()
+	provider, err := NewPrometheusMeterProvider(prometheus.NewRegistry(), WithSeriesTTL(testTTL))
+	if err != nil {
+		t.Fatalf("NewPrometheusMeterProvider: %v", err)
+	}
+	if err := provider.Shutdown(context.Background()); err != nil {
+		t.Errorf("Shutdown: %v", err)
 	}
 }

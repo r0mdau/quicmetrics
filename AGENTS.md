@@ -8,7 +8,7 @@
 | --- | --- |
 | `cmd/quicmetrics` | Server command: flags, wiring, `run(ctx, args, stderr) error` |
 | `cmd/quicmetrics-client` | Client that generates realistic counters, gauges and histograms (`generator.go`) and pipelines them in batches |
-| `internal/server` | `Server` (QUIC sessions), `Listen` + `QUICConfig` (hardened listener), `Aggregator` (counters, gauges, histograms) + `Parse`, `Limits` (`limits.go`), `CertReloader`, `CAReloader`, `SelfSignedTLSConfig` |
+| `internal/server` | `Server` (QUIC sessions), `Listen` + `QUICConfig` (hardened listener), `Aggregator` (counters, gauges, histograms) + `Parse`, `Limits` (`limits.go`), series expiry (`pipeline.go`, `accumulator.go`), `CertReloader`, `CAReloader`, `SelfSignedTLSConfig` |
 | `internal/protocol` | `ALPN`, `DefaultAddr` and the QUIC application error codes, shared by both commands |
 | `internal/tlstest` | Test-only CA and certificate issuing, so no key file is committed |
 
@@ -172,6 +172,37 @@ go run ./cmd/quicmetrics-client -insecure  # generate all metric types for 10s (
   metric is logged and dropped: the exporter can't turn such keys into label names. This one is
   not a limit: it warns for every metric, like the other invalid input.
 
+## Series expiry
+
+With `-series-ttl` (default 15m, 0 disables, `WithSeriesTTL`), a series (name and tag set) no
+metric updated for the TTL disappears from `/metrics` and frees its memory. Names do not expire:
+an instrument keeps its slot of `-max-metric-names` for the life of the process, as the SDK keeps
+the instrument (about 700 bytes) for the life of its provider. The SDK can't forget a cumulative
+series (its TODO #3006), so with a TTL:
+
+- `NewPrometheusMeterProvider` returns a `MeterProvider` with two SDK providers: the one the
+  `Aggregator` records into, whose reader has **delta** temporality (for gauges too, which
+  `sdkmetric.DeltaTemporalitySelector` leaves cumulative) and only holds the series updated since
+  the last scrape, and one that hosts the exporter. Without a TTL it is the plain provider.
+- The `pipeline` is the exporter's `Producer`: each scrape collects that delta, adds it to the
+  `accumulator` (cumulative counters and histograms, last gauge values, one state per series),
+  forgets the series not seen for more than the TTL, and returns copies of the cumulative metrics.
+  The exporter still does every translation, so names and options don't change.
+- The accumulator applies the 2000 series limit itself, with the SDK rule (1999 series and the
+  `otel.metric.overflow` one), to the series that are alive. Series that expired give their room
+  back at the end of the scrape that forgets them.
+- Time is only read at scrapes (`pipeline.now`): a series expires at the first scrape more than
+  the TTL after the last scrape that saw an update, and nothing runs without scrapes. A long gap
+  between scrapes does not expire the series that the delta shows were updated.
+- An expired series that comes back restarts from zero with a new start time, like a counter that
+  reset.
+- The exporter keeps every metric name and type it ever exposed (`metricFamilies`), even without
+  series, so an expired `foo` counter still blocks a later `foo.total` gauge, with the same outcome
+  as the collision in the protocol rules.
+  `TestAnExpiredCounterStillBlocksAGaugeWithTheSamePrometheusName` pins this.
+- `quicmetrics_series_expired_total` counts the series forgotten, and appears with the first one.
+  The `quicmetrics_metrics_dropped_total` series expire like any other.
+
 ## Crash safety
 
 One client must never take the server down.
@@ -198,13 +229,16 @@ One client must never take the server down.
 - A counter total or histogram `_sum` whose running total of whole values passes 2^63
   (about 9.2e18) wraps negative: the SDK adds whole-valued floats into an int64
   (`9e18|c` twice gives about -4.5e17). The per-value 2^63 bound can't prevent it. It is
-  unreachable with realistic values, causes no crash and scrapes keep working.
+  unreachable with realistic values, causes no crash and scrapes keep working. With a series TTL
+  the SDK only adds up one scrape interval, and the accumulator adds float64, which wraps
+  nowhere but stops counting units above 2^53.
 - Invalid lines, unsupported values and invalid tag keys are still logged at warn one by one,
   with client-controlled text (quoted by `slog`). Only the drops for a limit are rate limited
   and counted.
-- Each counter, gauge and histogram keeps at most 2000 tag sets (`NewPrometheusMeterProvider`).
-  Beyond that, values go to a single `otel_metric_overflow="true"` series: a sum for a
-  counter, the last overflowing value for a gauge, the merged observations for a histogram.
+- Each counter, gauge and histogram keeps at most 2000 tag sets (`NewPrometheusMeterProvider`),
+  or 2000 unexpired ones with a series TTL. Beyond that, values go to a single
+  `otel_metric_overflow="true"` series: a sum for a counter, the last overflowing value for a
+  gauge, the merged observations for a histogram.
 - Sample rates are not applied to histograms: a sampled `latency:12|h|@0.1` adds one
   observation, so `_count` and `_sum` undercount by 1/rate. Recording a value 1/rate times
   would be unbounded work.
@@ -219,8 +253,21 @@ One client must never take the server down.
   2000 tag sets hold about 7.7 GB, and more with long tags: those figures come from short ones,
   and 20 tags of 64 and 200 bytes cost several KB more per tag set. Lower the limit of names where
   memory is tight. There is no limit of series in all.
-- A gauge keeps its last value on `/metrics` forever after the client stops sending it: there
-  is no staleness or expiry.
+- A gauge keeps its last value on `/metrics` after the client stops sending it for the series
+  TTL (15m by default), and forever with `-series-ttl 0`. A gauge set less often than the TTL
+  therefore disappears between updates.
+- With a series TTL the SDK's cardinality limit also applies to the delta of each scrape
+  interval, where it cannot know the series that already exist: a client that sends 2000 new tag
+  sets between two scrapes pushes the updates of established series of that instrument into
+  the overflow series for that interval, so they look idle and may expire. Without a TTL
+  established series keep their place. Raising the limit would only make the attack dearer.
+  Likewise, an instrument full of idle series sends new ones to the overflow series until the
+  scrape that expires the idle ones.
+- With a series TTL, a name that stopped being sent still counts against `-max-metric-names` and
+  blocks its Prometheus name for another type. Only a restart frees them.
+- The TTL is counted in scrapes: an update seen by a scrape keeps the series for the TTL from
+  that scrape, so a series can outlive its last update by up to one scrape interval. A metric
+  recorded just before a scrape finishes may be counted in the next one, which is not lost.
 - A client that completes the handshake and keeps sending packets (but no data) holds a session
   slot for ever: the idle timeout only fires on silence, and there is no deadline on the first
   stream or between metrics. The same holds for a client that never reads its acks (the ack
