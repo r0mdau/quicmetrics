@@ -8,8 +8,9 @@
 | --- | --- |
 | `cmd/quicmetrics` | Server command: flags, wiring, `run(ctx, args, stderr) error` |
 | `cmd/quicmetrics-client` | Client that generates realistic counters, gauges and histograms (`generator.go`) and pipelines them in batches |
-| `internal/server` | `Server` (QUIC sessions), `Listen` + `QUICConfig` (hardened listener), `Aggregator` (counters, gauges, histograms) + `Parse`, `SelfSignedTLSConfig` |
+| `internal/server` | `Server` (QUIC sessions), `Listen` + `QUICConfig` (hardened listener), `Aggregator` (counters, gauges, histograms) + `Parse`, `CertReloader`, `SelfSignedTLSConfig` |
 | `internal/protocol` | `ALPN`, `DefaultAddr` and the QUIC application error codes, shared by both commands |
+| `internal/tlstest` | Test-only CA and certificate issuing, so no key file is committed |
 
 ## Commands
 
@@ -19,7 +20,7 @@ make bench                          # benchmarks, not part of check; compare run
 make vuln                           # govulncheck
 make compose-up / compose-down      # server + Prometheus in Docker
 go run ./cmd/quicmetrics            # QUIC on localhost:4242/udp, metrics on :2223
-go run ./cmd/quicmetrics-client     # generate all metric types for 10s (see -h for flags)
+go run ./cmd/quicmetrics-client -insecure  # generate all metric types for 10s (see -h for flags)
 ```
 
 ## Dependencies
@@ -36,8 +37,19 @@ go run ./cmd/quicmetrics-client     # generate all metric types for 10s (see -h 
 
 - Client and server take the ALPN and default address from `internal/protocol`. Never
   hardcode them. The container defaults to `-addr 0.0.0.0:4242`.
-- TLS: the server generates a self-signed P-256 certificate at every start, and the client
-  uses `InsecureSkipVerify`.
+- TLS 1.3 only. The server takes `-tls-cert` and `-tls-key` (both or neither). Its
+  `CertReloader` (`tls.Config.GetCertificate`) re-reads both files every `-tls-reload-interval`
+  (30s by default) and switches to the new pair when their content changed, so replacing the
+  files, renaming over them and the atomic `..data` symlink swap of a Kubernetes Secret all
+  work. A pair that fails to load (including a cert and key read on both sides of a swap) is
+  logged as a warning (once per content for parse errors, every interval for read errors), and
+  the previous certificate stays. A pair that is invalid at start is a fatal startup
+  error. Without the flags the server generates a self-signed P-256 certificate at every start
+  and logs a warning: development only.
+- The client verifies the server by default: against `-tls-ca` (PEM bundle) or the system
+  roots, for the host of `-addr` or `-tls-server-name`. `InsecureSkipVerify` is only set by
+  `-insecure` (with a warning, and a usage error together with `-tls-ca`), so talking to a
+  development server needs `-insecure`. Never default it back on.
 - The server accepts **one stream per connection**: `server.QUICConfig` allows one
   bidirectional stream and no unidirectional stream, so a second stream makes `OpenStream` fail
   with `StreamLimitReachedError` on the client. The stream is a byte stream, so metrics
@@ -195,6 +207,7 @@ One client must never take the server down.
   and assert their result once after the loop so they never time an error path.
   `TestRecordAllocations` pins the allocations of `Aggregator.Record`: lower the budget when
   you remove allocations, and justify raising it.
+- Tests build their certificates with `internal/tlstest`. Never commit key or certificate files.
 - Avoid new dependencies. Never commit `build/` or binaries.
 
 ## Review large changes

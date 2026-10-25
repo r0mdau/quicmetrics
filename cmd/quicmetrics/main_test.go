@@ -5,10 +5,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -19,6 +22,7 @@ import (
 	"github.com/quic-go/quic-go"
 
 	"github.com/r0mdau/quicmetrics/internal/protocol"
+	"github.com/r0mdau/quicmetrics/internal/tlstest"
 )
 
 type syncBuffer struct {
@@ -158,7 +162,14 @@ func TestRunFlags(t *testing.T) {
 	if err := run(context.Background(), []string{"-h"}, io.Discard); err != nil {
 		t.Errorf("run -h = %v, want nil", err)
 	}
-	for _, args := range [][]string{{"-no-such-flag"}, {"-log-level", "loud"}} {
+	for _, args := range [][]string{
+		{"-no-such-flag"},
+		{"-log-level", "loud"},
+		{"-tls-cert", "tls.crt"},
+		{"-tls-key", "tls.key"},
+		{"-tls-cert", "tls.crt", "-tls-key", "tls.key", "-tls-reload-interval", "0s"},
+		{"-tls-reload-interval", "-1s"},
+	} {
 		if err := run(context.Background(), args, io.Discard); !errors.Is(err, errUsage) {
 			t.Errorf("run %v = %v, want errUsage", args, err)
 		}
@@ -178,5 +189,121 @@ func TestRunRejectsInvalidQUICLimits(t *testing.T) {
 		if err == nil || errors.Is(err, errUsage) || !strings.Contains(err.Error(), tc.flag) {
 			t.Errorf("run %v = %v, want a validation error naming %s", args, err, tc.flag)
 		}
+	}
+}
+
+func TestRunWarnsAboutTheSelfSignedCertificate(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var logs syncBuffer
+	errc := make(chan error, 1)
+	go func() {
+		errc <- run(ctx, []string{"-addr", "127.0.0.1:0", "-metrics-addr", "127.0.0.1:0"}, &logs)
+	}()
+	waitForAddr(t, &logs, quicAddrRe)
+	cancel()
+	if err := <-errc; err != nil {
+		t.Fatalf("run = %v, want nil after cancel", err)
+	}
+	if !regexp.MustCompile(`level=WARN msg="no -tls-cert and -tls-key: using a self-signed certificate`).MatchString(logs.String()) {
+		t.Errorf("no self-signed warning in:\n%s", logs.String())
+	}
+}
+
+func TestRunFailsOnInvalidCertificateFiles(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	broken := filepath.Join(dir, "broken.pem")
+	if err := os.WriteFile(broken, []byte("broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, args := range map[string][]string{
+		"missing files": {"-tls-cert", filepath.Join(dir, "missing.crt"), "-tls-key", filepath.Join(dir, "missing.key")},
+		"invalid files": {"-tls-cert", broken, "-tls-key", broken},
+	} {
+		args = append(args, "-addr", "127.0.0.1:0", "-metrics-addr", "127.0.0.1:0")
+		err := run(context.Background(), args, io.Discard)
+		if err == nil || errors.Is(err, errUsage) || !strings.Contains(err.Error(), "create TLS config") {
+			t.Errorf("%s: run = %v, want a startup error", name, err)
+		}
+	}
+}
+
+func TestRunServesTheConfiguredCertificateAndReloadsIt(t *testing.T) {
+	t.Parallel()
+	ca := tlstest.NewCA(t, "test CA")
+	dir := t.TempDir()
+	certFile, keyFile := filepath.Join(dir, "tls.crt"), filepath.Join(dir, "tls.key")
+	writePair := func(host string) {
+		t.Helper()
+		pair := ca.IssueServer(t, host, "127.0.0.1")
+		for path, data := range map[string][]byte{certFile: pair.CertPEM, keyFile: pair.KeyPEM} {
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	writePair("first.test")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var logs syncBuffer
+	errc := make(chan error, 1)
+	go func() {
+		errc <- run(ctx, []string{
+			"-addr", "127.0.0.1:0", "-metrics-addr", "127.0.0.1:0",
+			"-tls-cert", certFile, "-tls-key", keyFile, "-tls-reload-interval", "10ms",
+		}, &logs)
+	}()
+	quicAddr := waitForAddr(t, &logs, quicAddrRe)
+
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(ca.PEM)
+	dial := func(roots *x509.CertPool) (*quic.Conn, error) {
+		dialCtx, cancelDial := context.WithTimeout(ctx, 5*time.Second)
+		defer cancelDial()
+		return quic.DialAddr(dialCtx, quicAddr, &tls.Config{
+			RootCAs: roots, NextProtos: []string{protocol.ALPN}, MinVersion: tls.VersionTLS13,
+		}, nil)
+	}
+	peerCommonName := func() string {
+		t.Helper()
+		conn, err := dial(pool)
+		if err != nil {
+			t.Fatalf("dial with the CA: %v", err)
+		}
+		defer func() { _ = conn.CloseWithError(0, "") }()
+		return conn.ConnectionState().TLS.PeerCertificates[0].Subject.CommonName
+	}
+
+	if got := peerCommonName(); got != "first.test" {
+		t.Fatalf("served certificate = %q, want first.test", got)
+	}
+	if conn, err := dial(x509.NewCertPool()); err == nil {
+		_ = conn.CloseWithError(0, "")
+		t.Error("a client that doesn't trust the CA connected")
+	}
+	if strings.Contains(logs.String(), "self-signed") {
+		t.Errorf("self-signed warning logged with -tls-cert:\n%s", logs.String())
+	}
+
+	writePair("second.test")
+	deadline := time.Now().Add(5 * time.Second)
+	for peerCommonName() != "second.test" {
+		if time.Now().After(deadline) {
+			t.Fatalf("certificate never reloaded; logs:\n%s", logs.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Errorf("run = %v, want nil after cancel", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not return after cancel")
 	}
 }

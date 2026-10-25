@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -25,7 +26,10 @@ import (
 	"github.com/r0mdau/quicmetrics/internal/server"
 )
 
-const shutdownTimeout = 5 * time.Second
+const (
+	shutdownTimeout          = 5 * time.Second
+	defaultTLSReloadInterval = 30 * time.Second
+)
 
 var errUsage = errors.New("invalid command line")
 
@@ -49,6 +53,9 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	metricsAddr := fs.String("metrics-addr", ":2223", "TCP address of the Prometheus /metrics endpoint")
 	idleTimeout := fs.Duration("idle-timeout", server.DefaultIdleTimeout, "close a session after this long without traffic")
 	maxSessions := fs.Int("max-sessions", server.DefaultMaxSessions, "maximum number of concurrent QUIC sessions, others are rejected")
+	tlsCert := fs.String("tls-cert", "", "PEM certificate chain of the QUIC listener, reloaded when the file changes (with -tls-key)")
+	tlsKey := fs.String("tls-key", "", "PEM private key of the QUIC listener (with -tls-cert)")
+	tlsReload := fs.Duration("tls-reload-interval", defaultTLSReloadInterval, "how often -tls-cert and -tls-key are checked for changes")
 	var level slog.Level
 	fs.TextVar(&level, "log-level", slog.LevelInfo, "minimum log level: debug, info, warn or error")
 	if err := fs.Parse(args); err != nil {
@@ -56,6 +63,17 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 			return nil
 		}
 		return fmt.Errorf("%w: %w", errUsage, err)
+	}
+	var invalid error
+	switch {
+	case (*tlsCert == "") != (*tlsKey == ""):
+		invalid = errors.New("-tls-cert and -tls-key must be set together")
+	case *tlsReload <= 0:
+		invalid = fmt.Errorf("-tls-reload-interval must be positive, got %v", *tlsReload)
+	}
+	if invalid != nil {
+		fmt.Fprintln(stderr, "quicmetrics:", invalid)
+		return fmt.Errorf("%w: %w", errUsage, invalid)
 	}
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level}))
 
@@ -78,9 +96,22 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	}
 	meter := provider.Meter("github.com/r0mdau/quicmetrics")
 
-	tlsConf, err := server.SelfSignedTLSConfig()
-	if err != nil {
-		return fmt.Errorf("create TLS config: %w", err)
+	var (
+		tlsConf *tls.Config
+		certs   *server.CertReloader
+	)
+	if *tlsCert != "" {
+		certs, err = server.NewCertReloader(*tlsCert, *tlsKey, logger)
+		if err != nil {
+			return fmt.Errorf("create TLS config: %w", err)
+		}
+		tlsConf = certs.TLSConfig()
+	} else {
+		logger.Warn("no -tls-cert and -tls-key: using a self-signed certificate generated at start, clients cannot verify it, for development only")
+		tlsConf, err = server.SelfSignedTLSConfig()
+		if err != nil {
+			return fmt.Errorf("create TLS config: %w", err)
+		}
 	}
 	listener, err := server.Listen(*addr, tlsConf, quicConf)
 	if err != nil {
@@ -113,6 +144,9 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 			cancel(err)
 		}
 	})
+	if certs != nil {
+		wg.Go(func() { certs.Watch(ctx, *tlsReload) })
+	}
 	wg.Go(func() {
 		logger.Info("serving Prometheus metrics", "addr", httpListener.Addr().String(), "path", "/metrics")
 		if err := httpServer.Serve(httpListener); !errors.Is(err, http.ErrServerClosed) {

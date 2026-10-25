@@ -23,7 +23,8 @@ Libraries used:
 | --- | --- |
 | `cmd/quicmetrics` | Server command: flags, wiring, graceful shutdown |
 | `cmd/quicmetrics-client` | Client that generates realistic counters, gauges and histograms |
-| `internal/server` | QUIC listener and sessions, DogStatsD parsing, OpenTelemetry aggregation, TLS |
+| `internal/server` | QUIC listener and sessions, DogStatsD parsing, OpenTelemetry aggregation, TLS certificates |
+| `internal/tlstest` | Throwaway certificates for tests |
 | `internal/protocol` | ALPN and default address shared by server and client |
 
 ## Wire protocol
@@ -64,13 +65,15 @@ The server closes a connection with one of these QUIC application error codes (d
 
 ## Getting started
 
-Launch the server
+Launch the server. Without `-tls-cert` and `-tls-key` it generates a self-signed certificate
+and warns about it, which is for development only (see [TLS](#tls))
 
     go run ./cmd/quicmetrics
 
-Generate metrics for 10 seconds at 10 metrics per second
+Generate metrics for 10 seconds at 10 metrics per second. The client verifies the server
+certificate, so it needs `-insecure` to accept the self-signed one of a development server
 
-    go run ./cmd/quicmetrics-client
+    go run ./cmd/quicmetrics-client -insecure
 
 View prometheus metrics
 
@@ -84,6 +87,9 @@ Server flags:
 | `-metrics-addr` | `:2223` | TCP address of the Prometheus `/metrics` endpoint |
 | `-idle-timeout` | `30s` | A session without traffic for this long is closed |
 | `-max-sessions` | `1000` | Concurrent QUIC sessions, further connections are closed with application error code 2 (`too many sessions`) |
+| `-tls-cert` | | PEM certificate chain of the QUIC listener, reloaded when the file changes. Needs `-tls-key` |
+| `-tls-key` | | PEM private key of the QUIC listener. Needs `-tls-cert` |
+| `-tls-reload-interval` | `30s` | How often `-tls-cert` and `-tls-key` are checked for changes |
 | `-log-level` | `info` | `debug` also logs every received metric |
 
 The server stops gracefully on `SIGINT` or `SIGTERM`.
@@ -106,6 +112,9 @@ Client flags:
 | `-count` | `0` | Stop after this many metrics, `0` means no limit |
 | `-functions` | `5` | Number of simulated functions (1-10), drives tag cardinality |
 | `-seed` | `0` | Random seed to replay a run, `0` picks one (logged at start) |
+| `-tls-ca` | system roots | PEM bundle of the CAs that sign the server certificate |
+| `-tls-server-name` | host of `-addr` | Name the server certificate must be valid for |
+| `-insecure` | `false` | Do not verify the server certificate, with a warning. Development only. Excludes `-tls-ca` |
 | `-log-level` | `info` | `debug` also logs every metric sent |
 
 The client sends four counters, tagged by `function` and `region`: `faas.invocations`
@@ -135,12 +144,50 @@ milliseconds, and cannot be configured. A value can be any finite number up to 2
 magnitude (a timer cannot be negative). A sample rate (`|@0.5`) is validated like for counters
 but never scales a histogram: `_count` and `_sum` only cover the values actually received.
 
+### TLS
+
+QUIC always runs over TLS 1.3. The server presents the certificate of `-tls-cert` and
+`-tls-key` (PEM files, for example a Kubernetes Secret managed by cert-manager and mounted
+as files). Every `-tls-reload-interval` it re-reads both files and, if their content changed,
+serves the new certificate to new connections without a restart. Open sessions keep the one
+they were set up with. This works with the atomic symlink swap the kubelet does when a Secret
+is updated. If the new pair can't be loaded (unreadable, invalid, or a certificate that doesn't
+match its key, as can happen for one interval in the middle of a swap), the server logs a
+warning, keeps the previous certificate and tries again when the content changes. At start
+the files must be valid, otherwise the server exits.
+
+Without `-tls-cert` and `-tls-key` the server generates a self-signed certificate at every
+start and logs a warning: clients can't verify it, so this is for development only. Setting
+only one of the two flags is an error.
+
+The client verifies the server certificate against the CAs of `-tls-ca`, or the system roots
+when the flag is not set, and against the host of `-addr`, or `-tls-server-name` when the
+address is an IP or a name the certificate doesn't cover. **Verification is on by default**: a
+client without `-tls-ca` fails to connect to a server using a private CA or the self-signed
+fallback with `certificate signed by unknown authority`. Only `-insecure` turns it off, with a
+warning, and it can't be combined with `-tls-ca`.
+
+A private CA and server certificate for local tests, with openssl:
+
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 \
+      -subj /CN=dev-ca -addext basicConstraints=critical,CA:TRUE -keyout ca.key -out ca.pem
+    openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+      -subj /CN=localhost -keyout tls.key -out tls.csr
+    openssl x509 -req -in tls.csr -CA ca.pem -CAkey ca.key -days 30 -out tls.crt \
+      -extfile <(printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth')
+    go run ./cmd/quicmetrics -tls-cert tls.crt -tls-key tls.key
+    go run ./cmd/quicmetrics-client -tls-ca ca.pem
+
 ### Client examples
+
+The examples run against a development server (self-signed certificate), hence `-insecure`;
+with a real certificate use `-tls-ca` or the system roots instead.
 
 Send 400 metrics at 200 per second across 4 functions. With a fixed seed, a fresh server
 always ends up with the same 81 counter series (plus 20 gauge series and 24 histogram series):
 
-    $ go run ./cmd/quicmetrics-client -rate 200 -count 400 -functions 4 -seed 7
+    $ go run ./cmd/quicmetrics-client -insecure -rate 200 -count 400 -functions 4 -seed 7
+    level=WARN msg="-insecure: the server certificate is not verified, for development only"
     level=INFO msg="generating metrics" addr=localhost:4242 seed=7 rate=200 count=400 duration=10s batch=100 functions=4
     level=INFO msg="metrics acknowledged" count=400 elapsed=1.996s
 
@@ -155,16 +202,16 @@ always ends up with the same 81 counter series (plus 20 gauge series and 24 hist
 Other runs:
 
     # Defaults: 10 metrics/s for 10s, 5 functions, random seed (logged at start)
-    go run ./cmd/quicmetrics-client
+    go run ./cmd/quicmetrics-client -insecure
 
     # Keep sending until Ctrl+C, with all 10 functions (most tag sets)
-    go run ./cmd/quicmetrics-client -rate 200 -duration 0 -functions 10
+    go run ./cmd/quicmetrics-client -insecure -rate 200 -duration 0 -functions 10
 
     # Exactly 1000 metrics, as fast as the acks come back
-    go run ./cmd/quicmetrics-client -rate 0 -count 1000
+    go run ./cmd/quicmetrics-client -insecure -rate 0 -count 1000
 
     # Replay a run, and log every metric sent
-    go run ./cmd/quicmetrics-client -seed 7 -count 5 -log-level debug
+    go run ./cmd/quicmetrics-client -insecure -seed 7 -count 5 -log-level debug
 
 ## Development
 
@@ -200,9 +247,17 @@ non-root distroless container:
 
     make compose-up
 
-Generate metrics from your machine to the server running in docker compose:
+Generate metrics from your machine to the server running in docker compose. The suite doesn't
+set `-tls-cert` and `-tls-key`, so the server uses its self-signed development certificate:
 
-    go run ./cmd/quicmetrics-client
+    go run ./cmd/quicmetrics-client -insecure
+
+To use your own certificate instead, mount the files and add the flags to `command` in
+[compose.yaml](compose.yaml) (the files are read by the non-root container user):
+
+    volumes:
+      - ./certs:/etc/quicmetrics:ro
+    command: ["-addr", "0.0.0.0:4242", "-tls-cert", "/etc/quicmetrics/tls.crt", "-tls-key", "/etc/quicmetrics/tls.key"]
 
 Check the metrics:
 
