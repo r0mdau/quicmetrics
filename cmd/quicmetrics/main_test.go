@@ -56,10 +56,10 @@ func waitForAddr(t *testing.T, logs *syncBuffer, re *regexp.Regexp) string {
 
 func sendMetric(t *testing.T, stream *quic.Stream, msg string) {
 	t.Helper()
-	if _, err := stream.Write([]byte(msg)); err != nil {
+	if _, err := stream.Write([]byte(msg + "\n")); err != nil {
 		t.Fatalf("write %q: %v", msg, err)
 	}
-	if _, err := io.ReadFull(stream, make([]byte, len(msg))); err != nil {
+	if _, err := io.ReadFull(stream, make([]byte, len(msg)+1)); err != nil {
 		t.Fatalf("read ack of %q: %v", msg, err)
 	}
 }

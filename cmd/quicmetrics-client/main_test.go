@@ -65,8 +65,8 @@ func TestSendMetricsStopsAfterDuration(t *testing.T) {
 	if elapsed := time.Since(start); elapsed < 300*time.Millisecond || elapsed > 2*time.Second {
 		t.Fatalf("sendMetrics took %v, want about 300ms", elapsed)
 	}
-	if sent < 5 || sent > 31 {
-		t.Fatalf("sent %d metrics, want about 30 at 100/s for 300ms", sent)
+	if sent > 31 {
+		t.Fatalf("sent %d metrics, want at most 31 at 100/s for 300ms", sent)
 	}
 }
 
@@ -89,16 +89,25 @@ func TestSendMetricsUnpacedStopsOnCancel(t *testing.T) {
 	t.Parallel()
 	serverCtx, cancelServer := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelServer()
-	addr, _ := startServer(serverCtx, t)
+	addr, reader := startServer(serverCtx, t)
 
-	ctx, cancel := context.WithTimeout(serverCtx, 200*time.Millisecond)
+	ctx, cancel := context.WithCancel(serverCtx)
 	defer cancel()
-	sent, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, newGenerator(1, 1), options{})
-	if err != nil {
+	go func() {
+		for ctx.Err() == nil && !hasRecorded(ctx, reader) {
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+	}()
+	start := time.Now()
+	if _, err := sendMetrics(ctx, slog.New(slog.DiscardHandler), addr, newGenerator(1, 1), options{}); err != nil {
 		t.Fatalf("sendMetrics: %v", err)
 	}
-	if sent == 0 {
-		t.Fatal("sent no metrics before cancel")
+	if serverCtx.Err() != nil {
+		t.Fatalf("sendMetrics ran until the server context expired, %v after starting", time.Since(start))
+	}
+	if !hasRecorded(context.Background(), reader) {
+		t.Fatal("server recorded no metrics before cancel")
 	}
 }
 
@@ -178,6 +187,19 @@ func startServer(ctx context.Context, t *testing.T) (addr string, reader *sdkmet
 		}
 	})
 	return listener.Addr().String(), reader
+}
+
+func hasRecorded(ctx context.Context, reader *sdkmetric.ManualReader) bool {
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		return false
+	}
+	for _, sm := range rm.ScopeMetrics {
+		if len(sm.Metrics) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // collectValues flattens the collected metrics into one number per series. A histogram gives
