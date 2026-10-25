@@ -37,10 +37,20 @@ bidirectional stream. A stream is a byte stream, so metrics are newline-delimite
   share one write and one metric can span several writes.
 - a line is at most 8192 bytes (`server.MaxLineLength`) without its terminator. A longer line
   closes the session with QUIC application error code 1.
-- the server acknowledges every non-empty line by echoing it back, terminated by `\n`, whether
-  or not it could be recorded. The client sends a line and waits for its ack. A client that
-  closes its stream or connection before reading an ack may never get it, although the metric
-  is still recorded.
+- the server never echoes metrics. It acknowledges them in bulk: after it has processed every
+  complete line it has read, and before it waits for more bytes, it writes one line holding the
+  number of non-empty lines it has processed on the stream so far, in decimal (`1000\n`). A
+  line counts whether it was recorded or logged and dropped (invalid, unsupported type, over a
+  limit), but an empty line does not, and neither does an incomplete line until the client closes its
+  side of the stream. Acks are strictly increasing, at
+  most one per chunk the server reads, and none is sent when nothing new was processed.
+- a client can therefore pipeline: write as many lines as it wants without waiting, and read
+  acks as they come. Ack `N` means the first `N` non-empty lines it wrote are processed, so
+  `sent - N` are still in flight. `quicmetrics-client` keeps at most 4 times `-batch` metrics in
+  flight so a slow server holds the client back.
+- a client must read its last ack before it closes the stream or connection: an ack written
+  just before the session closes may be lost, and so may the acks for lines processed just
+  before a `line too long` close. The metrics are recorded either way.
 
 ## Getting started
 
@@ -71,12 +81,13 @@ Client flags:
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `-addr` | `localhost:4242` | UDP address of the quicmetrics server |
-| `-rate` | `10` | Metrics per second, from 0.001 to 1e9 (the first is sent right away). `0` sends as fast as acks come back |
-| `-duration` | `10s` | Stop this long after connecting, `0` runs until `SIGINT` or `SIGTERM` |
+| `-rate` | `10` | Metrics per second, from 0.001 to 1e9 (the first is sent right away), a target the client cannot exceed but may miss when acks hold it back. `0` sends as fast as acks come back, 4 batches ahead |
+| `-batch` | `100` | Maximum metrics per write, from 1 to 10000. Metrics that come due together (a high `-rate`) share a write, so a low rate sends one metric per write |
+| `-duration` | `10s` | Stop sending this long after connecting (then wait up to 5s for the last acks), `0` runs until `SIGINT` or `SIGTERM` |
 | `-count` | `0` | Stop after this many metrics, `0` means no limit |
 | `-functions` | `5` | Number of simulated functions (1-10), drives tag cardinality |
 | `-seed` | `0` | Random seed to replay a run, `0` picks one (logged at start) |
-| `-log-level` | `info` | `debug` also logs every acknowledged metric |
+| `-log-level` | `info` | `debug` also logs every metric sent |
 
 The client sends four counters, tagged by `function` and `region`: `faas.invocations`
 (with `cold_start`), `http.requests` (with `method` and `status`), `faas.billed.ms` and
@@ -111,7 +122,7 @@ Send 400 metrics at 200 per second across 4 functions. With a fixed seed, a fres
 always ends up with the same 81 counter series (plus 20 gauge series and 24 histogram series):
 
     $ go run ./cmd/quicmetrics-client -rate 200 -count 400 -functions 4 -seed 7
-    level=INFO msg="generating metrics" addr=localhost:4242 seed=7 rate=200 count=400 duration=10s functions=4
+    level=INFO msg="generating metrics" addr=localhost:4242 seed=7 rate=200 count=400 duration=10s batch=100 functions=4
     level=INFO msg="metrics acknowledged" count=400 elapsed=1.996s
 
     $ curl -s localhost:2223/metrics | grep -E '^(faas|http)'
@@ -133,7 +144,7 @@ Other runs:
     # Exactly 1000 metrics, as fast as the acks come back
     go run ./cmd/quicmetrics-client -rate 0 -count 1000
 
-    # Replay a run, and log every metric as it is acknowledged
+    # Replay a run, and log every metric sent
     go run ./cmd/quicmetrics-client -seed 7 -count 5 -log-level debug
 
 ## Development

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -54,13 +56,22 @@ func waitForAddr(t *testing.T, logs *syncBuffer, re *regexp.Regexp) string {
 	return ""
 }
 
-func sendMetric(t *testing.T, stream *quic.Stream, msg string) {
+func sendMetrics(t *testing.T, stream *quic.Stream, msgs ...string) {
 	t.Helper()
-	if _, err := stream.Write([]byte(msg + "\n")); err != nil {
-		t.Fatalf("write %q: %v", msg, err)
+	if _, err := stream.Write([]byte(strings.Join(msgs, "\n") + "\n")); err != nil {
+		t.Fatalf("write %q: %v", msgs, err)
 	}
-	if _, err := io.ReadFull(stream, make([]byte, len(msg)+1)); err != nil {
-		t.Fatalf("read ack of %q: %v", msg, err)
+	acks := bufio.NewReader(stream)
+	for processed := 0; processed < len(msgs); {
+		line, err := acks.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read ack after %d of %d metrics: %v", processed, len(msgs), err)
+		}
+		n, err := strconv.Atoi(strings.TrimSuffix(line, "\n"))
+		if err != nil || n <= processed || n > len(msgs) {
+			t.Fatalf("ack %q, want a count in (%d, %d]", line, processed, len(msgs))
+		}
+		processed = n
 	}
 }
 
@@ -88,14 +99,12 @@ func TestRunServesMetricsAndShutsDownCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open stream: %v", err)
 	}
-	for _, msg := range []string{
+	sendMetrics(t, stream,
 		"e2e.hits:4|c|#env:test",
 		"a.b:1|c",
 		"a_b:1|c",
 		"process_cpu_seconds:1|c",
-	} {
-		sendMetric(t, stream, msg)
-	}
+	)
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get("http://" + httpAddr + "/metrics")
