@@ -282,6 +282,10 @@ func (a *Aggregator) lineTooLong(ctx context.Context, client string) {
 	a.drops.record(ctx, dropLineTooLong, client, MaxLineLength)
 }
 
+func (a *Aggregator) slowClient(ctx context.Context, client string) {
+	a.drops.record(ctx, dropSlowClient, client, 0)
+}
+
 func (a *Aggregator) instrumentError(ctx context.Context, msg, name string, err error) {
 	switch {
 	case errors.Is(err, errNamesFull):

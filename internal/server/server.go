@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"runtime/debug"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/quic-go/quic-go"
 
@@ -25,16 +27,46 @@ const MaxLineLength = 8 << 10
 // DefaultMaxSessions is the session cap of a Server created without WithMaxSessions.
 const DefaultMaxSessions = 1000
 
-var errLineTooLong = fmt.Errorf("line longer than %d bytes", MaxLineLength)
+var (
+	errLineTooLong = fmt.Errorf("line longer than %d bytes", MaxLineLength)
+
+	errNoStream   = errors.New("no stream opened")
+	errNoLine     = errors.New("no line received")
+	errAckNotRead = errors.New("ack not read")
+)
+
+// Timeouts bounds how long a session may hold a slot without making progress, however many
+// packets it sends. A timeout of 0 or less disables its deadline.
+type Timeouts struct {
+	// FirstStream is how long a client has to open its stream after the handshake.
+	FirstStream time.Duration
+	// Line is how long a session may go without sending a complete non-empty line.
+	Line time.Duration
+	// Ack is how long the server waits for the client to take an ack.
+	Ack time.Duration
+}
+
+// DefaultTimeouts returns the timeouts of a Server created without WithTimeouts.
+func DefaultTimeouts() Timeouts {
+	return Timeouts{FirstStream: 10 * time.Second, Line: time.Minute, Ack: 10 * time.Second}
+}
+
+// deadlineStream is the stream of a session: a quic.Stream or a net.Conn.
+type deadlineStream interface {
+	io.ReadWriter
+	SetReadDeadline(time.Time) error
+	SetWriteDeadline(time.Time) error
+}
 
 // Server accepts QUIC connections and feeds every received metric to an Aggregator.
 //
 // Each connection carries one stream of newline-delimited metrics, acknowledged in bulk.
 //
-// A Server runs a bounded number of sessions at once.
+// A Server runs a bounded number of sessions at once, and closes those that stop making progress.
 type Server struct {
 	agg      *Aggregator
 	logger   *slog.Logger
+	timeouts Timeouts
 	sessions sync.WaitGroup
 	slots    chan struct{}
 }
@@ -48,9 +80,14 @@ func WithMaxSessions(n int) Option {
 	return func(s *Server) { s.slots = make(chan struct{}, n) }
 }
 
+// WithTimeouts sets the deadlines of a session, closed with protocol.CodeSlowClient when missed.
+func WithTimeouts(t Timeouts) Option {
+	return func(s *Server) { s.timeouts = t }
+}
+
 // New returns a Server that records metrics with agg and logs to logger.
 func New(agg *Aggregator, logger *slog.Logger, opts ...Option) *Server {
-	s := &Server{agg: agg, logger: logger}
+	s := &Server{agg: agg, logger: logger, timeouts: DefaultTimeouts()}
 	WithMaxSessions(DefaultMaxSessions)(s)
 	for _, opt := range opts {
 		opt(s)
@@ -102,21 +139,39 @@ func (s *Server) handleConn(ctx context.Context, conn *quic.Conn) {
 		logger.Info("session closed")
 	}()
 
-	stream, err := conn.AcceptStream(ctx)
-	if err != nil {
-		if !isExpectedClose(ctx, err) {
-			logger.Warn("accept stream", "err", err)
-		}
-		return
+	stream, err := s.acceptStream(ctx, conn)
+	if err == nil {
+		err = s.serveStream(context.WithoutCancel(ctx), stream)
 	}
-	err = s.serveStream(context.WithoutCancel(ctx), stream)
 	switch {
 	case errors.Is(err, errLineTooLong):
 		closeCode, closeReason = protocol.CodeLineTooLong, "line too long"
 		logger.Debug("closing session", "err", err)
 		s.agg.lineTooLong(ctx, clientName(conn))
+	case errors.Is(err, errNoStream), errors.Is(err, errNoLine), errors.Is(err, errAckNotRead):
+		closeCode, closeReason = protocol.CodeSlowClient, err.Error()
+		logger.Debug("closing session", "err", err)
+		s.agg.slowClient(ctx, clientName(conn))
 	case err != nil && !isExpectedClose(ctx, err):
 		logger.Warn("session ended with error", "err", err)
+	}
+}
+
+func (s *Server) acceptStream(ctx context.Context, conn *quic.Conn) (*quic.Stream, error) {
+	acceptCtx := ctx
+	if s.timeouts.FirstStream > 0 {
+		var cancel context.CancelFunc
+		acceptCtx, cancel = context.WithTimeout(ctx, s.timeouts.FirstStream)
+		defer cancel()
+	}
+	stream, err := conn.AcceptStream(acceptCtx)
+	switch {
+	case err == nil:
+		return stream, nil
+	case ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded):
+		return nil, errNoStream
+	default:
+		return nil, fmt.Errorf("accept stream: %w", err)
 	}
 }
 
@@ -139,7 +194,7 @@ func isExpectedClose(ctx context.Context, err error) bool {
 	return ok && appErr.Remote && appErr.ErrorCode == protocol.CodeNoError
 }
 
-func (s *Server) serveStream(ctx context.Context, rw io.ReadWriter) error {
+func (s *Server) serveStream(ctx context.Context, rw deadlineStream) error {
 	r := bufio.NewReaderSize(rw, MaxLineLength+2)
 	var processed, acked uint64
 	var ack []byte
@@ -148,16 +203,28 @@ func (s *Server) serveStream(ctx context.Context, rw io.ReadWriter) error {
 			return nil
 		}
 		ack = append(strconv.AppendUint(ack[:0], processed, 10), '\n')
+		if err := rw.SetWriteDeadline(deadline(s.timeouts.Ack)); err != nil {
+			return fmt.Errorf("set ack deadline: %w", err)
+		}
 		if _, err := rw.Write(ack); err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				return errAckNotRead
+			}
 			return fmt.Errorf("write ack: %w", err)
 		}
 		acked = processed
-		return nil
+		return rw.SetReadDeadline(deadline(s.timeouts.Line))
+	}
+	if err := rw.SetReadDeadline(deadline(s.timeouts.Line)); err != nil {
+		return fmt.Errorf("set read deadline: %w", err)
 	}
 	for {
 		line, err := r.ReadSlice('\n')
 		if errors.Is(err, bufio.ErrBufferFull) {
 			return errLineTooLong
+		}
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return errNoLine
 		}
 		eof := errors.Is(err, io.EOF)
 		if err != nil && !eof {
@@ -180,6 +247,13 @@ func (s *Server) serveStream(ctx context.Context, rw io.ReadWriter) error {
 			return nil
 		}
 	}
+}
+
+func deadline(timeout time.Duration) time.Time {
+	if timeout <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(timeout)
 }
 
 func hasBufferedLine(r *bufio.Reader) bool {

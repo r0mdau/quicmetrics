@@ -5,10 +5,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -190,13 +192,18 @@ func parseAcks(t *testing.T, out string) []uint64 {
 	return acks
 }
 
+type plainStream struct {
+	io.Reader
+	io.Writer
+}
+
+func (plainStream) SetReadDeadline(time.Time) error  { return nil }
+func (plainStream) SetWriteDeadline(time.Time) error { return nil }
+
 func serveBytes(t *testing.T, srv *Server, in io.Reader) (acks string, err error) {
 	t.Helper()
 	var out bytes.Buffer
-	err = srv.serveStream(context.Background(), struct {
-		io.Reader
-		io.Writer
-	}{in, &out})
+	err = srv.serveStream(context.Background(), plainStream{in, &out})
 	return out.String(), err
 }
 
@@ -291,10 +298,7 @@ func TestServeStreamPropagatesAckError(t *testing.T) {
 	agg, _ := newTestAggregator()
 	want := errors.New("stream closed")
 
-	err := New(agg, discardLogger).serveStream(context.Background(), struct {
-		io.Reader
-		io.Writer
-	}{strings.NewReader("foo:1|c\n"), failingWriter{want}})
+	err := New(agg, discardLogger).serveStream(context.Background(), plainStream{strings.NewReader("foo:1|c\n"), failingWriter{want}})
 	if !errors.Is(err, want) {
 		t.Fatalf("err = %v, want %v", err, want)
 	}
@@ -703,6 +707,317 @@ func TestIdleSessionIsClosedQuietly(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "level=WARN") {
 		t.Errorf("idle close was logged as a warning:\n%s", logs.String())
+	}
+}
+
+// serveWithPipe runs serveStream on one end of a pipe, which has real deadlines and no buffer.
+func serveWithPipe(t *testing.T, srv *Server) (client net.Conn, result <-chan error) {
+	t.Helper()
+	clientEnd, serverEnd := net.Pipe()
+	t.Cleanup(func() { _ = clientEnd.Close() })
+	errc := make(chan error, 1)
+	go func() {
+		defer func() { _ = serverEnd.Close() }()
+		errc <- srv.serveStream(context.Background(), serverEnd)
+	}()
+	return clientEnd, errc
+}
+
+func waitResult(t *testing.T, result <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(testTimeout):
+		t.Fatal("serveStream did not return")
+		return nil
+	}
+}
+
+func readAck(t *testing.T, conn net.Conn, want string) {
+	t.Helper()
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(conn, got); err != nil || string(got) != want {
+		t.Fatalf("ack = %q (%v), want %q", got, err, want)
+	}
+}
+
+func TestServeStreamClosesASessionThatSendsNoLine(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name   string
+		client func(net.Conn)
+	}{
+		{"silence", func(net.Conn) {}},
+		{"empty lines", func(c net.Conn) {
+			for {
+				if _, err := c.Write([]byte("\r\n")); err != nil {
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}},
+		{"a line one byte at a time", func(c net.Conn) {
+			for {
+				if _, err := c.Write([]byte("f")); err != nil {
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			agg, reader := newTestAggregator()
+			srv := New(agg, discardLogger, WithTimeouts(Timeouts{Line: 150 * time.Millisecond}))
+			client, result := serveWithPipe(t, srv)
+			go tt.client(client)
+
+			start := time.Now()
+			if err := waitResult(t, result); !errors.Is(err, errNoLine) {
+				t.Fatalf("serveStream = %v, want %v", err, errNoLine)
+			}
+			if elapsed := time.Since(start); elapsed < 100*time.Millisecond || elapsed > 2*time.Second {
+				t.Errorf("closed after %s, want about 150ms", elapsed)
+			}
+			assertValues(t, values(collectSums(t, reader)), nil)
+		})
+	}
+}
+
+func TestServeStreamKeepsASessionThatSendsLinesInTime(t *testing.T) {
+	t.Parallel()
+	agg, reader := newTestAggregator()
+	srv := New(agg, discardLogger, WithTimeouts(Timeouts{Line: 200 * time.Millisecond, Ack: time.Second}))
+	client, result := serveWithPipe(t, srv)
+
+	start := time.Now()
+	for i := 1; time.Since(start) < 700*time.Millisecond; i++ {
+		if _, err := client.Write([]byte("foo:1|c\n")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		readAck(t, client, strconv.Itoa(i)+"\n")
+		time.Sleep(60 * time.Millisecond)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := waitResult(t, result); err != nil {
+		t.Fatalf("serveStream = %v, want nil", err)
+	}
+	if got := values(collectSums(t, reader))["foo{}"]; got < 5 {
+		t.Errorf("foo = %v, want at least 5 lines recorded", got)
+	}
+}
+
+func TestServeStreamClosesASessionThatDoesNotTakeItsAck(t *testing.T) {
+	t.Parallel()
+	agg, reader := newTestAggregator()
+	srv := New(agg, discardLogger, WithTimeouts(Timeouts{Ack: 100 * time.Millisecond}))
+	client, result := serveWithPipe(t, srv)
+
+	if _, err := client.Write([]byte("foo:1|c\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := waitResult(t, result); !errors.Is(err, errAckNotRead) {
+		t.Fatalf("serveStream = %v, want %v", err, errAckNotRead)
+	}
+	assertValues(t, values(collectSums(t, reader)), map[string]float64{"foo{}": 1})
+}
+
+func TestServeStreamWithoutTimeoutsWaitsForever(t *testing.T) {
+	t.Parallel()
+	agg, _ := newTestAggregator()
+	srv := New(agg, discardLogger, WithTimeouts(Timeouts{}))
+	client, result := serveWithPipe(t, srv)
+
+	time.Sleep(300 * time.Millisecond)
+	if _, err := client.Write([]byte("foo:1|c\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	readAck(t, client, "1\n")
+	if err := client.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := waitResult(t, result); err != nil {
+		t.Fatalf("serveStream = %v, want nil", err)
+	}
+}
+
+func assertSlowClientClose(ctx context.Context, t *testing.T, conn *quic.Conn, reason string) {
+	t.Helper()
+	select {
+	case <-conn.Context().Done():
+	case <-ctx.Done():
+		t.Fatal("session was not closed")
+	}
+	var appErr *quic.ApplicationError
+	if err := context.Cause(conn.Context()); !errors.As(err, &appErr) ||
+		!appErr.Remote || appErr.ErrorCode != protocol.CodeSlowClient || appErr.ErrorMessage != reason {
+		t.Errorf("close cause = %v, want a remote application error %d with reason %q", err, protocol.CodeSlowClient, reason)
+	}
+}
+
+func TestHandleConnClosesSessionThatOpensNoStream(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	var logs syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	reader := sdkmetric.NewManualReader()
+	agg := NewAggregator(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test"), logger)
+	srv := New(agg, logger, WithTimeouts(Timeouts{FirstStream: 100 * time.Millisecond}))
+
+	listener := listenQUIC(t)
+	client := dialQUIC(ctx, t, listener)
+	done := runHandleConn(ctx, t, srv, listener)
+
+	waitDone(t, done)
+	assertSlowClientClose(ctx, t, client, "no stream opened")
+	assertDropped(t, reader, map[string]int64{"slow_client": 1})
+	for _, want := range []string{"level=WARN", "reason=slow_client", "example=127.0.0.1:"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("logs missing %q:\n%s", want, logs.String())
+		}
+	}
+}
+
+func TestHandleConnClosesSessionThatStopsSendingLines(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	agg, reader := newTestAggregator()
+	var logs syncBuffer
+	srv := New(agg, slog.New(slog.NewTextHandler(&logs, nil)), WithTimeouts(Timeouts{Line: 200 * time.Millisecond}))
+
+	listener := listenQUIC(t)
+	client := dialQUIC(ctx, t, listener)
+	done := runHandleConn(ctx, t, srv, listener)
+
+	stream, err := client.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	sendAndExpectAck(t, newTestClient(stream), "foo:1|c")
+	go func() {
+		for {
+			if _, err := stream.Write([]byte("\n")); err != nil {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+
+	waitDone(t, done)
+	assertNoSessionPanic(t, &logs)
+	assertSlowClientClose(ctx, t, client, "no line received")
+	assertValues(t, values(collectSums(t, reader)), map[string]float64{"foo{}": 1})
+	assertDropped(t, reader, map[string]int64{"slow_client": 1})
+}
+
+func TestHandleConnClosesSessionThatNeverReadsItsAcks(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	agg, _ := newTestAggregator()
+	srv := New(agg, discardLogger, WithTimeouts(Timeouts{Ack: 200 * time.Millisecond}))
+	listener := listenQUIC(t)
+	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{protocol.ALPN}, MinVersion: tls.VersionTLS13}
+	client, err := quic.DialAddr(ctx, listener.Addr().String(), tlsConf, &quic.Config{
+		InitialStreamReceiveWindow: 32,
+		MaxStreamReceiveWindow:     32,
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = client.CloseWithError(0, "") })
+	done := runHandleConn(ctx, t, srv, listener)
+
+	stream, err := client.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	go func() {
+		for ctx.Err() == nil {
+			if _, err := stream.Write([]byte("foo:1|c\n")); err != nil {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	waitDone(t, done)
+	assertSlowClientClose(ctx, t, client, "ack not read")
+}
+
+func TestHandleConnNamesTheCertificateOfASlowClient(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	serverCA, clientCA := tlstest.NewCA(t, "server CA"), tlstest.NewCA(t, "client CA")
+	file := filepath.Join(t.TempDir(), "ca.pem")
+	writeFile(t, file, clientCA.PEM)
+	cas, _ := newTestCAReloader(t, file)
+	listener := listenMTLS(t, serverCA, cas)
+	var logs syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	reader := sdkmetric.NewManualReader()
+	agg := NewAggregator(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test"), logger)
+	srv := New(agg, logger, WithTimeouts(Timeouts{FirstStream: 100 * time.Millisecond}))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := listener.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		srv.handleConn(ctx, conn)
+	}()
+	pair := clientCA.IssueClient(t, "agent-7")
+	cert, err := tls.X509KeyPair(pair.CertPEM, pair.KeyPEM)
+	if err != nil {
+		t.Fatalf("X509KeyPair: %v", err)
+	}
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(serverCA.PEM)
+	conn, err := quic.DialAddr(ctx, listener.Addr().String(), &tls.Config{
+		RootCAs:              pool,
+		NextProtos:           []string{protocol.ALPN},
+		MinVersion:           tls.VersionTLS13,
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &cert, nil },
+	}, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.CloseWithError(0, "") })
+
+	waitDone(t, done)
+	if !strings.Contains(logs.String(), "CN=agent-7") || !strings.Contains(logs.String(), "reason=slow_client") {
+		t.Errorf("the drop does not name the client certificate:\n%s", logs.String())
+	}
+}
+
+func TestServeFreesTheSlotOfASlowSession(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	agg, _ := newTestAggregator()
+	srv := New(agg, discardLogger, WithMaxSessions(1), WithTimeouts(Timeouts{FirstStream: 200 * time.Millisecond}))
+	listener := listenServer(t, DefaultIdleTimeout)
+	serveListener(ctx, t, srv, listener)
+
+	squatter := dialQUIC(ctx, t, listener.Listener)
+	assertSlowClientClose(ctx, t, squatter, "no stream opened")
+
+	stream, err := dialQUIC(ctx, t, listener.Listener).OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	if err := newTestClient(stream).ackOnce("foo:1|c"); err != nil {
+		t.Fatalf("a client after the slow one: %v", err)
 	}
 }
 

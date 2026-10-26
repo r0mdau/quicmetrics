@@ -53,6 +53,10 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	metricsAddr := fs.String("metrics-addr", ":2223", "TCP address of the Prometheus /metrics endpoint")
 	idleTimeout := fs.Duration("idle-timeout", server.DefaultIdleTimeout, "close a session after this long without traffic")
 	maxSessions := fs.Int("max-sessions", server.DefaultMaxSessions, "maximum number of concurrent QUIC sessions, others are rejected")
+	timeouts := server.DefaultTimeouts()
+	fs.DurationVar(&timeouts.FirstStream, "first-stream-timeout", timeouts.FirstStream, "close a session that opens no stream this long after the handshake, 0 for no deadline")
+	fs.DurationVar(&timeouts.Line, "line-timeout", timeouts.Line, "close a session that sends no complete line for this long, 0 for no deadline")
+	fs.DurationVar(&timeouts.Ack, "ack-timeout", timeouts.Ack, "close a session that does not take an ack within this long, 0 for no deadline")
 	tlsCert := fs.String("tls-cert", "", "PEM certificate chain of the QUIC listener, reloaded when the file changes (with -tls-key)")
 	tlsKey := fs.String("tls-key", "", "PEM private key of the QUIC listener (with -tls-cert)")
 	tlsClientCA := fs.String("tls-client-ca", "", "PEM bundle of the CAs that sign client certificates, reloaded when the file changes: when set, clients must present a valid certificate (mTLS)")
@@ -79,6 +83,8 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 		invalid = fmt.Errorf("-tls-reload-interval must be positive, got %v", *tlsReload)
 	case min(limits.MaxNames, limits.MaxTags, limits.MaxTagKeyLen, limits.MaxTagValueLen) < 0:
 		invalid = fmt.Errorf("-max-metric-names, -max-tags, -max-tag-key-len and -max-tag-value-len must not be negative, got %+v", limits)
+	case min(timeouts.FirstStream, timeouts.Line, timeouts.Ack) < 0:
+		invalid = fmt.Errorf("-first-stream-timeout, -line-timeout and -ack-timeout must not be negative, got %+v", timeouts)
 	case *seriesTTL < 0:
 		invalid = fmt.Errorf("-series-ttl must not be negative, got %v", *seriesTTL)
 	}
@@ -150,7 +156,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	})))
 	httpServer := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ErrorLog: errorLog}
 
-	srv := server.New(server.NewAggregator(meter, logger, server.WithLimits(limits)), logger, server.WithMaxSessions(*maxSessions))
+	srv := server.New(server.NewAggregator(meter, logger, server.WithLimits(limits)), logger, server.WithMaxSessions(*maxSessions), server.WithTimeouts(timeouts))
 
 	parent := ctx
 	ctx, cancel := context.WithCancelCause(ctx)
