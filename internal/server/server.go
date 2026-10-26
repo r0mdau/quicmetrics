@@ -38,7 +38,7 @@ var (
 // Timeouts bounds how long a session may hold a slot without making progress, however many
 // packets it sends. A timeout of 0 or less disables its deadline.
 type Timeouts struct {
-	// FirstStream is how long a client has to open its stream after the handshake.
+	// FirstStream is how long a client has to send its first bytes on its stream after the handshake.
 	FirstStream time.Duration
 	// Line is how long a session may go without sending a complete non-empty line.
 	Line time.Duration
@@ -213,7 +213,10 @@ func (s *Server) serveStream(ctx context.Context, rw deadlineStream) error {
 			return fmt.Errorf("write ack: %w", err)
 		}
 		acked = processed
-		return rw.SetReadDeadline(deadline(s.timeouts.Line))
+		if err := rw.SetReadDeadline(deadline(s.timeouts.Line)); err != nil {
+			return fmt.Errorf("set read deadline: %w", err)
+		}
+		return nil
 	}
 	if err := rw.SetReadDeadline(deadline(s.timeouts.Line)); err != nil {
 		return fmt.Errorf("set read deadline: %w", err)

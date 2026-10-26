@@ -54,10 +54,11 @@ stream is a byte stream, so metrics are newline-delimited
   just before the session closes may be lost, and so may the acks for lines processed just
   before a `line too long` close. The metrics are recorded either way.
 - a client must keep making progress, or the server closes the session with application error
-  code 3 (see below): it has `-first-stream-timeout` to open its stream after the handshake, it
-  must send a complete non-empty line at least every `-line-timeout` (empty lines and the
-  slow growth of a partial line do not count, and neither does a keep-alive), and it must read
-  its acks within `-ack-timeout`.
+  code 3 (see below): it has `-first-stream-timeout` after the handshake to send the first bytes on
+  its stream (a stream that is opened but not written to is not seen by the server), and it must
+  send a complete non-empty line at least every `-line-timeout` (empty lines and the slow growth
+  of a partial line do not count, and neither does a keep-alive). A client that does not read its
+  acks is closed after `-ack-timeout` once its flow-control window for acks is full.
 
 The server closes a connection with one of these QUIC application error codes (defined in
 `internal/protocol/errors.go`), and the close reason says why:
@@ -93,9 +94,9 @@ Server flags:
 | `-metrics-addr` | `:2223` | TCP address of the Prometheus `/metrics` endpoint |
 | `-idle-timeout` | `30s` | A session without traffic for this long is closed |
 | `-max-sessions` | `1000` | Concurrent QUIC sessions, further connections are closed with application error code 2 (`too many sessions`) |
-| `-first-stream-timeout` | `10s` | A session that opens no stream this long after the handshake is closed with application error code 3, `0` for no deadline |
+| `-first-stream-timeout` | `10s` | A session that sends no data on its stream this long after the handshake is closed with application error code 3, `0` for no deadline |
 | `-line-timeout` | `1m` | A session that sends no complete line for this long is closed with application error code 3, `0` for no deadline |
-| `-ack-timeout` | `10s` | A session that does not read an ack within this long is closed with application error code 3, `0` for no deadline |
+| `-ack-timeout` | `10s` | A session whose ack write is blocked this long (the client does not read its acks) is closed with application error code 3, `0` for no deadline |
 | `-tls-cert` | | PEM certificate chain of the QUIC listener, reloaded when the file changes. Needs `-tls-key` |
 | `-tls-key` | | PEM private key of the QUIC listener. Needs `-tls-cert` |
 | `-tls-client-ca` | | PEM bundle of the CAs that sign client certificates, reloaded when the file changes. When set, clients must present a valid certificate (mTLS) |

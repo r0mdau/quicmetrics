@@ -54,7 +54,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	idleTimeout := fs.Duration("idle-timeout", server.DefaultIdleTimeout, "close a session after this long without traffic")
 	maxSessions := fs.Int("max-sessions", server.DefaultMaxSessions, "maximum number of concurrent QUIC sessions, others are rejected")
 	timeouts := server.DefaultTimeouts()
-	fs.DurationVar(&timeouts.FirstStream, "first-stream-timeout", timeouts.FirstStream, "close a session that opens no stream this long after the handshake, 0 for no deadline")
+	fs.DurationVar(&timeouts.FirstStream, "first-stream-timeout", timeouts.FirstStream, "close a session that sends no data on its stream this long after the handshake, 0 for no deadline")
 	fs.DurationVar(&timeouts.Line, "line-timeout", timeouts.Line, "close a session that sends no complete line for this long, 0 for no deadline")
 	fs.DurationVar(&timeouts.Ack, "ack-timeout", timeouts.Ack, "close a session that does not take an ack within this long, 0 for no deadline")
 	tlsCert := fs.String("tls-cert", "", "PEM certificate chain of the QUIC listener, reloaded when the file changes (with -tls-key)")

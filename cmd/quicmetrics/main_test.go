@@ -495,10 +495,15 @@ func TestRunClosesASessionThatOpensNoStream(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	defer func() { _ = conn.CloseWithError(0, "") }()
-	<-conn.Context().Done()
+	select {
+	case <-conn.Context().Done():
+	case <-dialCtx.Done():
+		t.Fatal("session was not closed")
+	}
 	var appErr *quic.ApplicationError
-	if err := context.Cause(conn.Context()); !errors.As(err, &appErr) || appErr.ErrorCode != protocol.CodeSlowClient {
-		t.Errorf("close cause = %v, want application error %d", err, protocol.CodeSlowClient)
+	if err := context.Cause(conn.Context()); !errors.As(err, &appErr) ||
+		appErr.ErrorCode != protocol.CodeSlowClient || appErr.ErrorMessage != "no stream opened" {
+		t.Errorf("close cause = %v, want application error %d with reason %q", err, protocol.CodeSlowClient, "no stream opened")
 	}
 
 	cancel()

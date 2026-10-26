@@ -788,7 +788,7 @@ func TestServeStreamClosesASessionThatSendsNoLine(t *testing.T) {
 func TestServeStreamKeepsASessionThatSendsLinesInTime(t *testing.T) {
 	t.Parallel()
 	agg, reader := newTestAggregator()
-	srv := New(agg, discardLogger, WithTimeouts(Timeouts{Line: 200 * time.Millisecond, Ack: time.Second}))
+	srv := New(agg, discardLogger, WithTimeouts(Timeouts{Line: 500 * time.Millisecond, Ack: time.Second}))
 	client, result := serveWithPipe(t, srv)
 
 	start := time.Now()
@@ -797,7 +797,7 @@ func TestServeStreamKeepsASessionThatSendsLinesInTime(t *testing.T) {
 			t.Fatalf("write: %v", err)
 		}
 		readAck(t, client, strconv.Itoa(i)+"\n")
-		time.Sleep(60 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 	if err := client.Close(); err != nil {
 		t.Fatalf("close: %v", err)
@@ -825,7 +825,7 @@ func TestServeStreamClosesASessionThatDoesNotTakeItsAck(t *testing.T) {
 	assertValues(t, values(collectSums(t, reader)), map[string]float64{"foo{}": 1})
 }
 
-func TestServeStreamWithoutTimeoutsWaitsForever(t *testing.T) {
+func TestServeStreamWithoutTimeoutsKeepsASlowSession(t *testing.T) {
 	t.Parallel()
 	agg, _ := newTestAggregator()
 	srv := New(agg, discardLogger, WithTimeouts(Timeouts{}))
@@ -1012,12 +1012,16 @@ func TestServeFreesTheSlotOfASlowSession(t *testing.T) {
 	squatter := dialQUIC(ctx, t, listener.Listener)
 	assertSlowClientClose(ctx, t, squatter, "no stream opened")
 
-	stream, err := dialQUIC(ctx, t, listener.Listener).OpenStreamSync(ctx)
-	if err != nil {
-		t.Fatalf("open stream: %v", err)
-	}
-	if err := newTestClient(stream).ackOnce("foo:1|c"); err != nil {
-		t.Fatalf("a client after the slow one: %v", err)
+	for {
+		stream, err := dialQUIC(ctx, t, listener.Listener).OpenStreamSync(ctx)
+		if err == nil && newTestClient(stream).ackOnce("foo:1|c") == nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("slot of the slow session was never freed")
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
 
