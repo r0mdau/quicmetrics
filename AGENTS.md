@@ -25,7 +25,7 @@ go run ./cmd/quicmetrics-client -insecure  # generate all metric types for 10s (
 
 ## Dependencies
 
-- Go **1.26** with `github.com/quic-go/quic-go v0.64.1`: `*quic.Stream` and `*quic.Conn`
+- Go **1.27** with `github.com/quic-go/quic-go v0.64.1`: `*quic.Stream` and `*quic.Conn`
   are structs, and `quic.DialAddr` takes a `context.Context`. Never bring back
   `lucas-clemente/quic-go`.
 - OTel uses the stable metric API (`go.opentelemetry.io/otel` v1.47, Prometheus exporter
