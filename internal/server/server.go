@@ -132,12 +132,11 @@ func isExpectedClose(ctx context.Context, err error) bool {
 	if ctx.Err() != nil {
 		return true
 	}
-	var idleErr *quic.IdleTimeoutError
-	if errors.As(err, &idleErr) {
+	if _, ok := errors.AsType[*quic.IdleTimeoutError](err); ok {
 		return true
 	}
-	var appErr *quic.ApplicationError
-	return errors.As(err, &appErr) && appErr.Remote && appErr.ErrorCode == protocol.CodeNoError
+	appErr, ok := errors.AsType[*quic.ApplicationError](err)
+	return ok && appErr.Remote && appErr.ErrorCode == protocol.CodeNoError
 }
 
 func (s *Server) serveStream(ctx context.Context, rw io.ReadWriter) error {
