@@ -53,6 +53,12 @@ stream is a byte stream, so metrics are newline-delimited
 - a client must read its last ack before it closes the stream or connection: an ack written
   just before the session closes may be lost, and so may the acks for lines processed just
   before a `line too long` close. The metrics are recorded either way.
+- a client must keep making progress, or the server closes the session with application error
+  code 3 (see below): it has `-first-stream-timeout` after the handshake to send the first bytes on
+  its stream (a stream that is opened but not written to is not seen by the server), and it must
+  send a complete non-empty line at least every `-line-timeout` (empty lines and the slow growth
+  of a partial line do not count, and neither does a keep-alive). A client that does not read its
+  acks is closed after `-ack-timeout` once its flow-control window for acks is full.
 
 The server closes a connection with one of these QUIC application error codes (defined in
 `internal/protocol/errors.go`), and the close reason says why:
@@ -62,6 +68,7 @@ The server closes a connection with one of these QUIC application error codes (d
 | 0 | `CodeNoError` | Normal close: the client is done, or the server is shutting down |
 | 1 | `CodeLineTooLong` | A line exceeds 8192 bytes (reason `line too long`) |
 | 2 | `CodeServerBusy` | The server already serves `-max-sessions` sessions (reason `too many sessions`) |
+| 3 | `CodeSlowClient` | The client missed a deadline (reasons `no stream opened`, `no line received` and `ack not read`) |
 
 ## Getting started
 
@@ -87,6 +94,9 @@ Server flags:
 | `-metrics-addr` | `:2223` | TCP address of the Prometheus `/metrics` endpoint |
 | `-idle-timeout` | `30s` | A session without traffic for this long is closed |
 | `-max-sessions` | `1000` | Concurrent QUIC sessions, further connections are closed with application error code 2 (`too many sessions`) |
+| `-first-stream-timeout` | `10s` | A session that sends no data on its stream this long after the handshake is closed with application error code 3, `0` for no deadline |
+| `-line-timeout` | `1m` | A session that sends no complete line for this long is closed with application error code 3, `0` for no deadline |
+| `-ack-timeout` | `10s` | A session whose ack write is blocked this long (the client does not read its acks) is closed with application error code 3, `0` for no deadline |
 | `-tls-cert` | | PEM certificate chain of the QUIC listener, reloaded when the file changes. Needs `-tls-key` |
 | `-tls-key` | | PEM private key of the QUIC listener. Needs `-tls-cert` |
 | `-tls-client-ca` | | PEM bundle of the CAs that sign client certificates, reloaded when the file changes. When set, clients must present a valid certificate (mTLS) |
@@ -105,13 +115,15 @@ stream and no unidirectional stream, per-stream and per-connection receive windo
 (256 KiB and 512 KiB at most), and every client proves it owns its source address with a QUIC
 Retry round trip before the server keeps any handshake state for it, so spoofed addresses cost
 the server nothing. A client that stays silent for `-idle-timeout` is dropped, so a client sending
-less often than that needs a keep-alive.
+less often than that needs a keep-alive. A keep-alive only holds the connection: a session that
+sends no complete line for `-line-timeout` is closed anyway, so a client that sends metrics less
+often than that must reconnect.
 
 A metric over one of the limits above is dropped whole, and existing names keep recording once
 `-max-metric-names` is reached. Each drop is counted in
 `quicmetrics_metrics_dropped_total{reason="..."}` (`names`, `tags`, `tag_key_length`,
-`tag_value_length`, `invalid_name`, `reserved_name`, and `line_too_long` for each session closed because
-of a line over 8 KiB) on `/metrics`, and logged as one warning
+`tag_value_length`, `invalid_name`, `reserved_name`, `line_too_long` for each session closed because
+of a line over 8 KiB, and `slow_client` for each session closed because it missed a deadline) on `/metrics`, and logged as one warning
 per reason and minute. Metric names starting with `quicmetrics.`, `quicmetrics_`, `quicmetrics-`
 or `quicmetrics/` are reserved for the server's own metrics. The limits bound the memory a client
 can use, but not to a small number: every name may still hold up to 2000 tag sets, which

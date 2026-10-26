@@ -41,6 +41,7 @@ const (
 	dropReservedName   = "reserved_name"
 	dropInvalidName    = "invalid_name"
 	dropLineTooLong    = "line_too_long"
+	dropSlowClient     = "slow_client"
 )
 
 func reservedName(name string) bool {

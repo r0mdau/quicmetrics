@@ -174,6 +174,9 @@ func TestRunFlags(t *testing.T) {
 		{"-max-tags", "-1"},
 		{"-max-tag-key-len", "-1"},
 		{"-max-tag-value-len", "-1"},
+		{"-first-stream-timeout", "-1s"},
+		{"-line-timeout", "-1s"},
+		{"-ack-timeout", "-1s"},
 		{"-series-ttl", "-1s"},
 		{"-series-ttl", "soon"},
 	} {
@@ -465,6 +468,42 @@ func TestRunAppliesLimitFlags(t *testing.T) {
 	}
 	if strings.Contains(string(body), "other_hits") {
 		t.Errorf("/metrics exposes a metric over -max-metric-names:\n%s", body)
+	}
+
+	cancel()
+	if err := <-errc; err != nil {
+		t.Errorf("run = %v, want nil after cancel", err)
+	}
+}
+
+func TestRunClosesASessionThatOpensNoStream(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var logs syncBuffer
+	errc := make(chan error, 1)
+	go func() {
+		errc <- run(ctx, []string{"-addr", "127.0.0.1:0", "-metrics-addr", "127.0.0.1:0", "-first-stream-timeout", "200ms"}, &logs)
+	}()
+	quicAddr := waitForAddr(t, &logs, quicAddrRe)
+
+	dialCtx, cancelDial := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelDial()
+	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{protocol.ALPN}, MinVersion: tls.VersionTLS13}
+	conn, err := quic.DialAddr(dialCtx, quicAddr, tlsConf, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.CloseWithError(0, "") }()
+	select {
+	case <-conn.Context().Done():
+	case <-dialCtx.Done():
+		t.Fatal("session was not closed")
+	}
+	var appErr *quic.ApplicationError
+	if err := context.Cause(conn.Context()); !errors.As(err, &appErr) ||
+		appErr.ErrorCode != protocol.CodeSlowClient || appErr.ErrorMessage != "no stream opened" {
+		t.Errorf("close cause = %v, want application error %d with reason %q", err, protocol.CodeSlowClient, "no stream opened")
 	}
 
 	cancel()

@@ -93,12 +93,24 @@ go run ./cmd/quicmetrics-client -insecure  # generate all metric types for 10s (
   connection) instead of the quic-go defaults of 6 MB and 15 MB. An idle close is not logged as
   a warning.
 - Application error codes live in `internal/protocol/errors.go`, one constant each in a single
-  commented block, and are unique: 0 normal close, 1 line too long, 2 server busy. Add new ones
-  there and in the README table.
+  commented block, and are unique: 0 normal close, 1 line too long, 2 server busy, 3 slow client.
+  Add new ones there and in the README table.
 - `Server` serves at most `-max-sessions` (default 1000, `server.WithMaxSessions`) sessions at a
   time. `Serve` closes the others right after the handshake with `protocol.CodeServerBusy` (2)
   and the reason `too many sessions`, and logs a warning. Tests that call `handleConn` directly
   bypass the cap.
+- A session that stops making progress is closed with `protocol.CodeSlowClient` (3), because the
+  QUIC idle timeout only fires on silence and a client can keep a slot with packets that carry no
+  data. `Timeouts` (`DefaultTimeouts`, `WithTimeouts`; flags `-first-stream-timeout` 10s,
+  `-line-timeout` 1m, `-ack-timeout` 10s, 0 disables a deadline) has three deadlines, and the
+  close reason says which one was missed: `no stream opened` (`AcceptStream` after the handshake,
+  which only returns once the first bytes of the stream arrive), `no line received` (a read
+  deadline on the stream, armed at the start and again each time an ack is written, so it needs a
+  complete non-empty line: a partial line, however slowly it grows, and empty lines don't reset
+  it) and `ack not read` (a write deadline set before each ack, which only fires once the client's
+  flow-control window for acks is full: a small write returns at once while it has room).
+  `serveStream` takes a `deadlineStream` so tests can run it on a `net.Pipe`. The close is counted
+  as one `slow_client` drop and logged like `line_too_long`.
 - Only counters (`|c`), gauges (`|g`), histograms (`|h`) and timers (`|ms`) are recorded, with
   tags as attributes. Invalid lines are logged as warnings, and other metric types (sets
   `|s`, ...) at debug level. Both are acked, but not recorded.
@@ -160,14 +172,14 @@ go run ./cmd/quicmetrics-client -insecure  # generate all metric types for 10s (
   before it can take an instrument slot. Names starting with `quicmetrics.`, `quicmetrics_`,
   `quicmetrics-` or `quicmetrics/` are reserved (`reserved_name`) so no client can collide with the
   server's own metrics.
-- Every drop is counted in `quicmetrics_metrics_dropped_total{reason}` with the reason
-  `names`, `tags`, `tag_key_length`, `tag_value_length`, `reserved_name`, `invalid_name` or
-  `line_too_long` (one per session closed by the server, not per metric). It is an OTel counter
+- Every drop is counted in `quicmetrics_metrics_dropped_total{reason}` with the reason `names`,
+  `tags`, `tag_key_length`, `tag_value_length`, `reserved_name`, `invalid_name`, `line_too_long`
+  or `slow_client` (one per session closed by the server, not per metric). It is an OTel counter
   on the same meter, so it shares the registry and never needs a new dependency. Logs get one
   `metrics dropped` warning per reason and minute (the first drop is logged right away) with that
   `reason`, the drops since the last one and one example cut at 64 bytes (a metric name, or the
-  address and certificate subject of a client for `line_too_long`): never log a dropped metric
-  one by one, since the client chooses how many and what they say.
+  address and certificate subject of a client for `line_too_long` and `slow_client`): never log a
+  dropped metric one by one, since the client chooses how many and what they say.
 - Tag keys need an ASCII letter or digit and must not start with `__`, otherwise the whole
   metric is logged and dropped: the exporter can't turn such keys into label names. This one is
   not a limit: it warns for every metric, like the other invalid input.
@@ -268,10 +280,10 @@ One client must never take the server down.
 - The TTL is counted in scrapes: an update seen by a scrape keeps the series for the TTL from
   that scrape, so a series can outlive its last update by up to one scrape interval. A metric
   recorded just before a scrape finishes may be counted in the next one, which is not lost.
-- A client that completes the handshake and keeps sending packets (but no data) holds a session
-  slot for ever: the idle timeout only fires on silence, and there is no deadline on the first
-  stream or between metrics. The same holds for a client that never reads its acks (the ack
-  write blocks). With `-max-sessions` that means a determined client can fill the cap.
+- A client that sends its first bytes in time and then one complete line every `-line-timeout`,
+  whether or not it reads its acks, holds a session slot for ever: the deadlines bound progress,
+  not the rate. With `-max-sessions` a determined client can still fill the cap, at the price of
+  one line a minute per session.
 - With mTLS a rejected client is not logged by the server: `crypto/tls` has no hook for failed
   client verification. In TLS 1.3 the client only sees the rejection on its first read or
   write, not when dialing.

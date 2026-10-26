@@ -5,4 +5,5 @@ const (
 	CodeNoError     = 0
 	CodeLineTooLong = 1
 	CodeServerBusy  = 2
+	CodeSlowClient  = 3
 )
