@@ -69,7 +69,7 @@ func (e *expiryEnv) scrape(t testing.TB) string {
 
 func lines(body, prefix string) []string {
 	var out []string
-	for _, l := range strings.Split(body, "\n") {
+	for l := range strings.SplitSeq(body, "\n") {
 		if strings.HasPrefix(l, prefix) {
 			out = append(out, l)
 		}
