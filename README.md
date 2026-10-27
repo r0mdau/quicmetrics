@@ -291,8 +291,8 @@ each run with `go test -run '^$' -bench . -benchmem -count 10 ./... > old.txt` (
 and run [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat) `old.txt new.txt`.
 CI runs each benchmark once to keep them compiling and passing, not to time them.
 
-`make lint` needs [golangci-lint](https://golangci-lint.run/welcome/install/) v2
-(CI pins v2.15.0).
+`make lint` and `make vuln` run golangci-lint and govulncheck with `go tool`, at the versions
+pinned in [tools/go.mod](tools/go.mod), which CI and Dependabot use too.
 
 ## Run with docker compose
 
