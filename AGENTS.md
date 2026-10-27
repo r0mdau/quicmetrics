@@ -15,7 +15,8 @@
 ## Commands
 
 ```sh
-make check                          # fmt, vet, golangci-lint v2, test -race: run before you finish
+make fmt                            # gofmt the code, check only reports it
+make check                          # vet, golangci-lint v2 (gofmt, goimports), test -race: run before you finish
 make bench                          # benchmarks, not part of check; compare runs with benchstat
 make vuln                           # govulncheck
 make compose-up / compose-down      # server + Prometheus in Docker

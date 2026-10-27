@@ -1,55 +1,59 @@
 .DEFAULT_GOAL := build
 
 TOOL := go tool -modfile=tools/go.mod
+PLATFORMS ?= linux/amd64 linux/arm64
 
 fmt:
 	go fmt ./...
-.PHONY:fmt
+.PHONY: fmt
 
-vet: fmt
+vet:
 	go vet ./...
-.PHONY:vet
+.PHONY: vet
 
 lint:
 	$(TOOL) golangci-lint run
-.PHONY:lint
+.PHONY: lint
 
 vuln:
 	$(TOOL) govulncheck ./...
-.PHONY:vuln
+.PHONY: vuln
 
 tidy:
 	go mod tidy
 	cd tools && go mod tidy
-.PHONY:tidy
+.PHONY: tidy
 
 test:
 	go test -race -cover ./...
-.PHONY:test
+.PHONY: test
 
 bench:
 	go test -run '^$$' -bench . -benchmem ./...
-.PHONY:bench
+.PHONY: bench
 
-check: fmt vet lint test
-.PHONY:check
+check: vet lint test
+.PHONY: check
 
 build: vet
-	@echo ">> building amd64 binaries"
-	mkdir -p build
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-w -s" -o build/ ./cmd/...
-.PHONY:build
+	@for platform in $(PLATFORMS); do \
+		os=$${platform%/*}; arch=$${platform#*/}; \
+		echo ">> building $$os/$$arch binaries in build/$${os}_$$arch"; \
+		mkdir -p build/$${os}_$$arch && \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath -ldflags="-w -s" -o build/$${os}_$$arch/ ./cmd/... || exit 1; \
+	done
+.PHONY: build
 
 docker-build:
 	@echo ">> building docker image"
 	docker build -t r0mdau/quicmetrics .
-.PHONY:docker-build
+.PHONY: docker-build
 
 compose-up:
 	@echo ">> starting docker compose suite"
 	docker compose up --build -d
-.PHONY:compose-up
+.PHONY: compose-up
 
 compose-down:
 	docker compose down
-.PHONY:compose-down
+.PHONY: compose-down

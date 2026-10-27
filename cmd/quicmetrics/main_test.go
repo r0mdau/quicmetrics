@@ -163,6 +163,10 @@ func TestRunFlags(t *testing.T) {
 	if err := run(context.Background(), []string{"-h"}, io.Discard); err != nil {
 		t.Errorf("run -h = %v, want nil", err)
 	}
+	var out strings.Builder
+	if err := run(context.Background(), []string{"-version"}, &out); err != nil || !strings.HasPrefix(out.String(), "quicmetrics ") {
+		t.Errorf("run -version = %v, %q, want nil and the version", err, out.String())
+	}
 	for _, args := range [][]string{
 		{"-no-such-flag"},
 		{"-log-level", "loud"},
