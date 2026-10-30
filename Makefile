@@ -1,7 +1,6 @@
 .DEFAULT_GOAL := build
 
-GOLANGCI_LINT ?= golangci-lint
-GOVULNCHECK_VERSION ?= v1.9.0
+TOOL := go tool -modfile=tools/go.mod
 
 fmt:
 	go fmt ./...
@@ -11,16 +10,17 @@ vet: fmt
 	go vet ./...
 .PHONY:vet
 
-lint: fmt
-	$(GOLANGCI_LINT) run
+lint:
+	$(TOOL) golangci-lint run
 .PHONY:lint
 
 vuln:
-	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+	$(TOOL) govulncheck ./...
 .PHONY:vuln
 
 tidy:
 	go mod tidy
+	cd tools && go mod tidy
 .PHONY:tidy
 
 test:

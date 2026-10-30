@@ -4,3 +4,4 @@ build/
 prometheus/
 *.md
 compose.yaml
+tools/

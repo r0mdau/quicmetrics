@@ -25,6 +25,9 @@ go run ./cmd/quicmetrics-client -insecure  # generate all metric types for 10s (
 
 ## Dependencies
 
+- golangci-lint and govulncheck are pinned in `tools/go.mod`, a separate module, and run with
+  `go tool -modfile=tools/go.mod` through `make lint` and `make vuln`, which CI calls. Bump them
+  there, never in the Makefile or the workflow.
 - Go **1.27** with `github.com/quic-go/quic-go v0.64.1`: `*quic.Stream` and `*quic.Conn`
   are structs, and `quic.DialAddr` takes a `context.Context`. Never bring back
   `lucas-clemente/quic-go`.
