@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"sync"
 	"syscall"
 	"time"
@@ -69,11 +70,16 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	seriesTTL := fs.Duration("series-ttl", server.DefaultSeriesTTL, "forget a series no metric updated for this long, 0 to keep every series")
 	var level slog.Level
 	fs.TextVar(&level, "log-level", slog.LevelInfo, "minimum log level: debug, info, warn or error")
+	showVersion := fs.Bool("version", false, "print the version and exit")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
 		return fmt.Errorf("%w: %w", errUsage, err)
+	}
+	if *showVersion {
+		fmt.Fprintln(stderr, "quicmetrics", version())
+		return nil
 	}
 	var invalid error
 	switch {
@@ -164,7 +170,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		logger.Info("serving QUIC metrics listener", "addr", listener.Addr().String())
+		logger.Info("serving QUIC metrics listener", "addr", listener.Addr().String(), "version", version())
 		if err := srv.Serve(ctx, listener.Listener); err != nil {
 			cancel(err)
 		}
@@ -200,4 +206,14 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 		runErr = errors.Join(runErr, fmt.Errorf("shut down meter provider: %w", err))
 	}
 	return runErr
+}
+
+// version is the module version the go command stamped from version control, such as
+// v0.0.0-20261027023032-95a7d97a2a33 for an untagged commit, or (devel) without it.
+func version() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	return info.Main.Version
 }

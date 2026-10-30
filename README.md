@@ -107,6 +107,7 @@ Server flags:
 | `-max-tag-value-len` | `200` | Bytes in a tag value, `0` for no limit |
 | `-series-ttl` | `15m` | A series no metric updated for this long disappears from `/metrics`, `0` keeps every series |
 | `-log-level` | `info` | `debug` also logs every received metric |
+| `-version` | | Print the version stamped from git (`(devel)` for `go run` and the Docker image) and exit |
 
 The server stops gracefully on `SIGINT` or `SIGTERM`.
 
@@ -279,9 +280,10 @@ Other runs:
 
 ## Development
 
-    make check   # fmt, vet, golangci-lint, tests with -race
+    make fmt     # format the code
+    make check   # vet, golangci-lint (formatting included), tests with -race
     make vuln    # govulncheck
-    make build   # binaries in build/
+    make build   # linux/amd64 and linux/arm64 binaries in build/<os>_<arch>/, PLATFORMS=... to change
     make bench   # benchmarks with allocation stats
 
 `make bench` runs every benchmark in `internal/server` (parsing, recording, cardinality,
