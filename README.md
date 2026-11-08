@@ -285,6 +285,7 @@ Other runs:
     make vuln    # govulncheck
     make build   # linux/amd64 and linux/arm64 binaries in build/<os>_<arch>/, PLATFORMS=... to change
     make bench   # benchmarks with allocation stats
+    make fuzz    # each fuzz target for 30s, FUZZTIME=... to change
 
 `make bench` runs every benchmark in `internal/server` (parsing, recording, cardinality,
 Prometheus scrapes, QUIC sessions). Run a subset with
@@ -292,6 +293,13 @@ Prometheus scrapes, QUIC sessions). Run a subset with
 each run with `go test -run '^$' -bench . -benchmem -count 10 ./... > old.txt` (then `new.txt`)
 and run [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat) `old.txt new.txt`.
 CI runs each benchmark once to keep them compiling and passing, not to time them.
+
+`make fuzz` runs the fuzz targets of `internal/server`: `FuzzParse` checks the values `Parse`
+accepts, `FuzzRecordKeepsScrapesWorking` that no single line breaks a scrape, and
+`FuzzServeStreamFraming` the line framing and acks against a reference, for any chunking of the
+stream. `go test` runs their seeds, and CI fuzzes each one for 30 seconds. A failing input is
+saved in `internal/server/testdata/fuzz/` (an artifact in CI): commit it with the fix so it stays
+a regression test.
 
 `make lint` and `make vuln` run golangci-lint and govulncheck with `go tool`, at the versions
 pinned in [tools/go.mod](tools/go.mod), which CI and Dependabot use too.

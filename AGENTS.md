@@ -19,6 +19,7 @@ make fmt                            # gofmt the code, check only reports it
 make check                          # vet, golangci-lint v2 (gofmt, goimports), test -race: run before you finish
 make bench                          # benchmarks, not part of check; compare runs with benchstat
 make vuln                           # govulncheck
+make fuzz                           # each fuzz target for FUZZTIME (30s), CI runs it too
 make compose-up / compose-down      # server + Prometheus in Docker
 go run ./cmd/quicmetrics            # QUIC on localhost:4242/udp, metrics on :2223
 go run ./cmd/quicmetrics-client -insecure  # generate all metric types for 10s (see -h for flags)
@@ -309,6 +310,9 @@ One client must never take the server down.
   and assert their result once after the loop so they never time an error path.
   `TestRecordAllocations` pins the allocations of `Aggregator.Record`: lower the budget when
   you remove allocations, and justify raising it.
+- Fuzz targets (`FuzzParse`, `FuzzRecordKeepsScrapesWorking`, `FuzzServeStreamFraming`) guard
+  the crash safety and framing rules. Add a seed when you add a parsing or framing rule, and
+  commit the input under `testdata/fuzz/` that a fuzz failure saves, with its fix.
 - Tests build their certificates with `internal/tlstest`. Never commit key or certificate files.
 - Avoid new dependencies. Never commit `build/` or binaries.
 

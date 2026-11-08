@@ -1111,3 +1111,51 @@ func BenchmarkSessionsParallel(b *testing.B) {
 		})
 	}
 }
+
+type chunkReader struct {
+	r    io.Reader
+	size int
+}
+
+func (c chunkReader) Read(p []byte) (int, error) {
+	return c.r.Read(p[:min(len(p), c.size)])
+}
+
+// framedLines returns the number of non-empty lines in a stream and whether one of them is
+// longer than MaxLineLength, in which case the count stops before it.
+func framedLines(in []byte) (lines uint64, tooLong bool) {
+	for line := range bytes.SplitSeq(in, []byte("\n")) {
+		line = bytes.TrimSuffix(line, []byte("\r"))
+		if len(line) > MaxLineLength {
+			return lines, true
+		}
+		if len(line) > 0 {
+			lines++
+		}
+	}
+	return lines, false
+}
+
+func FuzzServeStreamFraming(f *testing.F) {
+	f.Add([]byte("foo:1|c\nfoo:2|c\r\n\n\r\nfoo:3|c"), uint16(1))
+	f.Add([]byte("\r\r\n\rfoo:1|c\r"), uint16(3))
+	f.Add([]byte(strings.Repeat("x", MaxLineLength)+"\r\nfoo:1|c\n"), uint16(4096))
+	f.Add([]byte("foo:1|c\n"+strings.Repeat("x", MaxLineLength+1)+"\n"), uint16(MaxLineLength))
+	f.Add([]byte(strings.Repeat("x", MaxLineLength+3)), uint16(0))
+	f.Fuzz(func(t *testing.T, in []byte, chunk uint16) {
+		agg, _ := newTestAggregator()
+		reader := chunkReader{bytes.NewReader(in), int(chunk) + 1}
+		acks, err := serveBytes(t, New(agg, discardLogger), reader)
+		wantLines, tooLong := framedLines(in)
+		if tooLong != errors.Is(err, errLineTooLong) || (err != nil && !tooLong) {
+			t.Fatalf("err = %v, want line too long: %t", err, tooLong)
+		}
+		var last uint64
+		if got := parseAcks(t, acks); len(got) > 0 {
+			last = got[len(got)-1]
+		}
+		if last > wantLines || (!tooLong && last != wantLines) {
+			t.Errorf("last ack = %d, want %d (line too long: %t)", last, wantLines, tooLong)
+		}
+	})
+}

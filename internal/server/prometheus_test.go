@@ -514,3 +514,16 @@ func TestPipelineShutdown(t *testing.T) {
 		t.Errorf("Shutdown: %v", err)
 	}
 }
+
+func FuzzRecordKeepsScrapesWorking(f *testing.F) {
+	for _, m := range fuzzMetrics {
+		f.Add(m)
+	}
+	f.Fuzz(func(t *testing.T, raw string) {
+		agg, registry := newPrometheusAggregator(t)
+		agg.Record(context.Background(), raw)
+		if _, err := registry.Gather(); err != nil {
+			t.Fatalf("Record(%q) breaks the scrape: %v", raw, err)
+		}
+	})
+}

@@ -1099,3 +1099,56 @@ func TestRecordAllocations(t *testing.T) {
 		})
 	}
 }
+
+var fuzzMetrics = []string{
+	"users.online:1|c|#country:france",
+	"foo:1.5|c|@0.1|#a:b,c",
+	"foo:1|c|",
+	"foo:1|c||#a:b",
+	"foo:9e18|c|@1e-50",
+	"foo:1|c|@0",
+	"foo:1|c|@NaN",
+	"temperature:-21.5|g|#room:a",
+	"temperature:NaN|g",
+	"latency:12|h|@0.5|#route:a",
+	"latency:12|ms",
+	"latency:+Inf|h",
+	"latency:-1|ms",
+	"users.unique:alice|s",
+	"foo\xff:1|c",
+	"foo:1|c|#__name__:x,9:y",
+	"foo:1|c|#a.b:x,a_b:y",
+	"latency:1|h|#le:5",
+	"not a metric",
+}
+
+func FuzzParse(f *testing.F) {
+	for _, m := range fuzzMetrics {
+		f.Add(m)
+	}
+	f.Fuzz(func(t *testing.T, raw string) {
+		m, err := Parse(raw)
+		if err != nil {
+			return
+		}
+		var v float64
+		switch val := m.Value.(type) {
+		case int64:
+			v = float64(val)
+		case float64:
+			v = val
+		default:
+			return
+		}
+		switch m.Type {
+		case dogstatsd.Counter, dogstatsd.Histogram, dogstatsd.Timer:
+			if math.IsNaN(v) || math.Abs(v) > maxCounterValue {
+				t.Errorf("Parse(%q) value = %v, want a number of at most 2^63 in magnitude", raw, v)
+			}
+		case dogstatsd.Gauge:
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				t.Errorf("Parse(%q) value = %v, want a finite number", raw, v)
+			}
+		}
+	})
+}
