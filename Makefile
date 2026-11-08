@@ -2,6 +2,7 @@
 
 TOOL := go tool -modfile=tools/go.mod
 PLATFORMS ?= linux/amd64 linux/arm64
+FUZZTIME ?= 30s
 
 fmt:
 	go fmt ./...
@@ -31,6 +32,15 @@ test:
 bench:
 	go test -run '^$$' -bench . -benchmem ./...
 .PHONY: bench
+
+fuzz:
+	@for pkg in $$(go list ./...); do \
+		for target in $$(go test -list '^Fuzz' $$pkg | grep '^Fuzz'); do \
+			echo ">> fuzzing $$pkg $$target for $(FUZZTIME)"; \
+			go test -run '^$$' -fuzz "^$$target\$$" -fuzztime $(FUZZTIME) $$pkg || exit 1; \
+		done; \
+	done
+.PHONY: fuzz
 
 check: vet lint test
 .PHONY: check
