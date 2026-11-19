@@ -1,6 +1,6 @@
 module github.com/r0mdau/quicmetrics
 
-go 1.27.3
+go 1.27.4
 
 require (
 	github.com/narqo/go-dogstatsd-parser v0.2.0
